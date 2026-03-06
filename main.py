@@ -26,8 +26,8 @@ SPACEMAN_CURRENCY = 'BRL'
 SPACEMAN_GAME_ID = 1301
 
 # Base de datos
-DB_FILE = 'eventos.db'
-MAX_HISTORY = 600          # Eventos máximos por API
+DB_FILE = 'data/eventos.db'
+MAX_HISTORY = 100000          # Eventos máximos por API
 
 # User-Agents rotativos para HTTP
 USER_AGENTS = [
