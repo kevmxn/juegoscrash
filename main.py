@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 
+# Lista ampliada de User-Agents (25)
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -42,6 +43,11 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
 BASE_SLEEP = 1.0
@@ -53,7 +59,7 @@ crash_ids: Set[str] = set()
 crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
 crash_history: list = []
 MAX_HISTORY = 15000
-CHUNK_SIZE = 300   # Lote de 300 eventos
+CHUNK_SIZE = 300
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
@@ -73,12 +79,17 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
         await asyncio.sleep(wait)
         return None
 
+    # Headers sin 'br' para evitar dependencia de brotli (aunque lo tenemos instalado)
     headers = {
         'User-Agent': get_random_user_agent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
+        'Referer': 'https://stake.com/',
+        'Origin': 'https://stake.com',
     }
 
     try:
@@ -87,7 +98,7 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 retry_after = int(resp.headers['Retry-After'])
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
-                logger.warning(f"[CRASH] ⚠️ Esperar {retry_after}s")
+                logger.warning(f"[CRASH] ⚠️ Esperar {retry_after}s (Retry-After)")
                 return None
             if resp.status == 200:
                 crash_status['consecutive_errors'] = 0
@@ -99,6 +110,7 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 logger.warning(f"[CRASH] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
+                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
             elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
@@ -182,7 +194,8 @@ async def monitor_crash():
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+            # Espera más larga (5-10 segundos) para reducir la tasa de peticiones
+            await asyncio.sleep(random.uniform(5.0, 10.0))
 
 async def broadcast(event_data: Dict[str, Any]):
     if not connected_clients:
@@ -215,7 +228,7 @@ async def websocket_handler(request):
                     'chunk_index': i // CHUNK_SIZE,
                     'total_chunks': (total + CHUNK_SIZE - 1) // CHUNK_SIZE
                 })
-                await asyncio.sleep(0.01)  # 10 ms entre lotes
+                await asyncio.sleep(0.05)  # 50 ms entre lotes
         logger.info("Cliente Crash conectado, historial enviado en lotes")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
@@ -258,7 +271,7 @@ async def self_ping():
 
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor CRASH con envío de historial en lotes (CHUNK=300)")
+    logger.info("🚀 Monitor CRASH con polling lento (5-10s) y envío de historial en lotes")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
