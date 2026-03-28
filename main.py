@@ -40,7 +40,7 @@ USER_AGENTS = [
 
 # Configuración de backoff
 BASE_SLEEP = 1.0
-MAX_SLEEP = 60.0
+MAX_SLEEP = 20.00
 
 # Control de IDs vistos para evitar duplicados (por API)
 crash_ids: Set[str] = set()
