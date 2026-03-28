@@ -75,21 +75,37 @@ def get_random_user_agent() -> str:
 async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
 
+    # Circuit breaker
     if now < crash_status['blocked_until']:
         wait = crash_status['blocked_until'] - now
         print(f"[CRASH] 🚫 Bloqueado por {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
+    # Backoff activo
     if now < crash_status['next_allowed_time']:
         wait = crash_status['next_allowed_time'] - now
         print(f"[CRASH] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    headers = {'User-Agent': get_random_user_agent()}
+    # Headers más completos para simular navegador
+    headers = {
+        'User-Agent': get_random_user_agent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0',
+    }
+
     try:
-        async with session.get(API_CRASH, headers=headers, timeout=5) as resp:
+        async with session.get(API_CRASH, headers=headers, timeout=10) as resp:
+            # Manejar Retry-After
             if 'Retry-After' in resp.headers:
                 retry_after = int(resp.headers['Retry-After'])
                 crash_status['next_allowed_time'] = time.time() + retry_after
@@ -97,10 +113,24 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 print(f"[CRASH] ⚠️ Esperar {retry_after}s (Retry-After)")
                 return None
 
+            # 200 OK
             if resp.status == 200:
                 crash_status['consecutive_errors'] = 0
                 return await resp.json()
-            elif resp.status == 429:
+
+            # 403 Forbidden (bloqueo)
+            if resp.status == 403:
+                crash_status['consecutive_errors'] += 1
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
+                crash_status['next_allowed_time'] = time.time() + backoff
+                print(f"[CRASH] 🚫 403 Forbidden - backoff {backoff:.1f}s")
+                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
+                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
+                    print(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por exceso de errores")
+                return None
+
+            # 429 Too Many Requests
+            if resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
@@ -109,7 +139,9 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
                     print(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por errores")
                 return None
-            elif 500 <= resp.status < 600:
+
+            # 5xx Server Errors
+            if 500 <= resp.status < 600:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
@@ -117,9 +149,16 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
-            else:
-                print(f"[CRASH] ⚠️ Código inesperado {resp.status}")
-                return None
+
+            # Otros códigos (400, 404, etc.)
+            print(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
+            crash_status['consecutive_errors'] += 1
+            backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
+            crash_status['next_allowed_time'] = time.time() + backoff
+            if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
+                crash_status['blocked_until'] = time.time() + BLOCK_TIME
+            return None
+
     except asyncio.TimeoutError:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
