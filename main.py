@@ -55,8 +55,12 @@ api_status = {
 
 # ============================================
 # BASE DE DATOS (funciones síncronas, ejecutadas en threads)
-# ============================================
+# ===========================================
+
 def init_db():
+    # Crear el directorio si no existe
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS eventos
