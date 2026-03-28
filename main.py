@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor unificado CRASH + SPACEMAN con servidor HTTP para Render
-- Crash: polling HTTP robusto (20 user‑agents, backoff, circuit breaker)
-- Spaceman: WebSocket persistente con reconexión automática
-- Servidor HTTP en el puerto de Render con endpoint /health
-- Logs mejorados con timestamps y niveles
+Monitor unificado CRASH + SPACEMAN con servidor HTTP y WebSocket completo
+- Envía historial a clientes WebSocket al conectar
+- Broadcast de nuevos eventos (crash y spaceman)
+- Headers sin Brotli para evitar errores
+- Backoff exponencial y circuit breaker
 """
 
 import asyncio
@@ -60,7 +60,7 @@ USER_AGENTS = [
 BASE_SLEEP = 1.0
 MAX_SLEEP = 60.0
 MAX_CONSECUTIVE_ERRORS = 10
-BLOCK_TIME = 300   # segundos
+BLOCK_TIME = 300
 
 crash_ids: Set[str] = set()
 crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
@@ -80,6 +80,13 @@ spaceman_last_multiplier: float = None
 spaceman_events_seen: Set[str] = set()
 
 # ============================================
+# ALMACENAMIENTO DE EVENTOS (en memoria)
+# ============================================
+crash_history: list = []      # Lista de eventos crash
+spaceman_history: list = []   # Lista de eventos spaceman
+MAX_HISTORY = 15000
+
+# ============================================
 # FUNCIONES CRASH
 # ============================================
 def get_random_user_agent() -> str:
@@ -87,31 +94,24 @@ def get_random_user_agent() -> str:
 
 async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
-
     if now < crash_status['blocked_until']:
         wait = crash_status['blocked_until'] - now
         logger.info(f"[CRASH] 🚫 Bloqueado por {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
-
     if now < crash_status['next_allowed_time']:
         wait = crash_status['next_allowed_time'] - now
         logger.info(f"[CRASH] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    # Headers sin br (para evitar error de Brotli si no está instalado, pero lo instalaremos)
     headers = {
         'User-Agent': get_random_user_agent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',  # Eliminamos br para mayor compatibilidad
+        'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0',
     }
 
     try:
@@ -122,12 +122,10 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 crash_status['consecutive_errors'] += 1
                 logger.warning(f"[CRASH] ⚠️ Esperar {retry_after}s (Retry-After)")
                 return None
-
             if resp.status == 200:
                 crash_status['consecutive_errors'] = 0
                 return await resp.json()
-
-            if resp.status == 403:
+            elif resp.status == 403:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
@@ -136,18 +134,15 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
                     logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por exceso de errores")
                 return None
-
-            if resp.status == 429:
+            elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
                 logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s")
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por errores")
                 return None
-
-            if 500 <= resp.status < 600:
+            elif 500 <= resp.status < 600:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
@@ -155,15 +150,14 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
-
-            logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
-            crash_status['consecutive_errors'] += 1
-            backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-            crash_status['next_allowed_time'] = time.time() + backoff
-            if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                crash_status['blocked_until'] = time.time() + BLOCK_TIME
-            return None
-
+            else:
+                logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
+                crash_status['consecutive_errors'] += 1
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
+                crash_status['next_allowed_time'] = time.time() + backoff
+                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
+                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
+                return None
     except asyncio.TimeoutError:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
@@ -182,23 +176,40 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
         return None
 
 async def procesar_crash(data: dict):
+    global crash_history
     event_id = data.get('id')
     if not event_id or event_id in crash_ids:
         return
-
     crash_ids.add(event_id)
     data_inner = data.get('data', {})
     result = data_inner.get('result', {})
     max_mult = result.get('maxMultiplier')
     round_dur = result.get('roundDuration')
     started_at = data_inner.get('startedAt')
-
     if max_mult is not None and max_mult > 0:
+        timestamp = time.time()
+        evento = {
+            'event_id': event_id,
+            'maxMultiplier': max_mult,
+            'roundDuration': round_dur,
+            'startedAt': started_at,
+            'timestamp_recepcion': datetime.now().isoformat()
+        }
+        crash_history.insert(0, evento)
+        if len(crash_history) > MAX_HISTORY:
+            crash_history.pop()
         logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Inicio={started_at}")
-        return max_mult
+        # Broadcast a clientes
+        await broadcast({
+            'tipo': 'crash',
+            'id': event_id,
+            'maxMultiplier': max_mult,
+            'roundDuration': round_dur,
+            'startedAt': started_at,
+            'timestamp_recepcion': evento['timestamp_recepcion']
+        })
     else:
         logger.warning(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
-        return None
 
 async def monitor_crash():
     logger.info("[CRASH] 🚀 Iniciando monitor")
@@ -213,10 +224,9 @@ async def monitor_crash():
 # FUNCIONES SPACEMAN
 # ============================================
 async def monitor_spaceman():
-    global spaceman_last_multiplier
+    global spaceman_last_multiplier, spaceman_history
     reconnect_delay = BASE_RECONNECT_DELAY
     logger.info("[SPACEMAN] 🚀 Iniciando monitor")
-
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -231,7 +241,6 @@ async def monitor_spaceman():
                     await ws.send_json(subscribe_msg)
                     logger.info("[SPACEMAN] 📡 Suscripción enviada")
                     reconnect_delay = BASE_RECONNECT_DELAY
-
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
@@ -245,29 +254,38 @@ async def monitor_spaceman():
                                             game_id = data.get("gameId", "unknown")
                                             if game_id not in spaceman_events_seen:
                                                 spaceman_events_seen.add(game_id)
+                                                evento = {
+                                                    'event_id': game_id,
+                                                    'maxMultiplier': multiplier,
+                                                    'timestamp_recepcion': datetime.now().isoformat()
+                                                }
+                                                spaceman_history.insert(0, evento)
+                                                if len(spaceman_history) > MAX_HISTORY:
+                                                    spaceman_history.pop()
                                                 logger.info(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x")
+                                                await broadcast({
+                                                    'tipo': 'spaceman',
+                                                    'id': game_id,
+                                                    'maxMultiplier': multiplier,
+                                                    'timestamp_recepcion': evento['timestamp_recepcion']
+                                                })
                                             else:
-                                                logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x (ignorado)")
+                                                logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
                             except (json.JSONDecodeError, KeyError, ValueError, IndexError):
                                 pass
                         elif msg.type == aiohttp.WSMsgType.CLOSE:
-                            logger.info("[SPACEMAN] 🔌 Conexión cerrada por el servidor")
+                            logger.info("[SPACEMAN] 🔌 Conexión cerrada")
                             break
                         elif msg.type == aiohttp.WSMsgType.ERROR:
-                            logger.error(f"[SPACEMAN] ❌ Error en WebSocket: {ws.exception()}")
+                            logger.error(f"[SPACEMAN] ❌ Error: {ws.exception()}")
                             break
-        except asyncio.TimeoutError:
-            logger.error(f"[SPACEMAN] ⏰ Timeout al conectar. Reintentando en {reconnect_delay:.1f}s")
-        except aiohttp.ClientError as e:
-            logger.error(f"[SPACEMAN] 🔴 Error de cliente: {e}. Reintentando en {reconnect_delay:.1f}s")
         except Exception as e:
-            logger.error(f"[SPACEMAN] 💥 Error inesperado: {e}. Reintentando en {reconnect_delay:.1f}s")
-
+            logger.error(f"[SPACEMAN] 💥 {e}, reconexión en {reconnect_delay:.1f}s")
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
 
 # ============================================
-# SERVIDOR HTTP + WEBSOCKET (aiohttp)
+# SERVIDOR WEB (HTTP + WebSocket)
 # ============================================
 connected_clients: Set[web.WebSocketResponse] = set()
 
@@ -276,10 +294,20 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        # Aquí podrías enviar historial, pero por ahora no tenemos BD integrada
-        # Si quieres enviar historial, necesitarías tener una BD.
-        # Por simplicidad, solo mantenemos la conexión abierta.
-        logger.info("Cliente WebSocket conectado")
+        # Enviar historial
+        if crash_history:
+            await ws.send_json({
+                'tipo': 'historial',
+                'api': 'crash',
+                'eventos': crash_history
+            })
+        if spaceman_history:
+            await ws.send_json({
+                'tipo': 'historial',
+                'api': 'spaceman',
+                'eventos': spaceman_history
+            })
+        logger.info("Cliente WebSocket conectado, historial enviado")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
@@ -288,18 +316,26 @@ async def websocket_handler(request):
         logger.info("Cliente WebSocket desconectado")
     return ws
 
+async def broadcast(event_data: Dict[str, Any]):
+    if not connected_clients:
+        return
+    message = json.dumps(event_data, default=str)
+    await asyncio.gather(
+        *[client.send_str(message) for client in connected_clients],
+        return_exceptions=True
+    )
+
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(text="Servidor activo. Use /ws para WebSocket o /health para health check.", status=200)
+    return web.Response(text="Servidor Crash+Spaceman activo. Use /ws para WebSocket o /health para health check.", status=200)
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/health', health_handler)
     app.router.add_get('/', root_handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 10000))
@@ -312,29 +348,23 @@ async def start_web_server():
 # MAIN
 # ============================================
 async def main():
+    from datetime import datetime
     logger.info("=" * 60)
-    logger.info("🚀 Monitor unificado CRASH + SPACEMAN con servidor HTTP")
+    logger.info("🚀 Monitor unificado CRASH + SPACEMAN con servidor HTTP/WebSocket")
     logger.info("=" * 60)
-
-    # Crear directorio para base de datos si no existe (opcional)
-    # Si no usas BD, puedes omitir
-    os.makedirs("data", exist_ok=True)
-    logger.info("Base de datos inicializada en data/eventos.db")
-
     tasks = [
         asyncio.create_task(start_web_server(), name="HTTP"),
         asyncio.create_task(monitor_crash(), name="Crash"),
         asyncio.create_task(monitor_spaceman(), name="Spaceman"),
     ]
-
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        logger.info("\n⏹ Deteniendo monitores...")
+        logger.info("\n⏹ Deteniendo...")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("✅ Monitores detenidos.")
+        logger.info("✅ Detenido")
 
 if __name__ == "__main__":
     asyncio.run(main())
