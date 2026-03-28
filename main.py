@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor unificado CRASH + SPACEMAN con servidor HTTP y WebSocket completo
+Monitor exclusivo para CRASH con servidor HTTP y WebSocket
 - Envía historial a clientes WebSocket al conectar
-- Broadcast de nuevos eventos (crash y spaceman)
-- Headers sin Brotli para evitar errores
-- Backoff exponencial y circuit breaker
+- Broadcast de nuevos eventos de Crash
+- Headers sin Brotli, backoff exponencial, circuit breaker
 """
 
 import asyncio
@@ -17,12 +16,9 @@ import time
 import random
 import os
 import logging
-from datetime import datetime  # <-- IMPORTACIÓN AÑADIDA
+from datetime import datetime
 from typing import Set, Dict, Any
 
-# ============================================
-# CONFIGURACIÓN DE LOGGING
-# ============================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -30,9 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# CONFIGURACIÓN CRASH
-# ============================================
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 
 USER_AGENTS = [
@@ -65,31 +58,9 @@ BLOCK_TIME = 300
 
 crash_ids: Set[str] = set()
 crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
-
-# ============================================
-# CONFIGURACIÓN SPACEMAN
-# ============================================
-SPACEMAN_WS = 'wss://dga.pragmaticplaylive.net/ws'
-SPACEMAN_CASINO_ID = 'ppcdk00000005349'
-SPACEMAN_CURRENCY = 'BRL'
-SPACEMAN_GAME_ID = 1301
-
-BASE_RECONNECT_DELAY = 1.0
-MAX_RECONNECT_DELAY = 60.0
-
-spaceman_last_multiplier: float = None
-spaceman_events_seen: Set[str] = set()
-
-# ============================================
-# ALMACENAMIENTO DE EVENTOS (en memoria)
-# ============================================
-crash_history: list = []      # Lista de eventos crash
-spaceman_history: list = []   # Lista de eventos spaceman
+crash_history: list = []
 MAX_HISTORY = 15000
 
-# ============================================
-# FUNCIONES CRASH
-# ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
@@ -133,7 +104,7 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 logger.warning(f"[CRASH] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por exceso de errores")
+                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
             elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
@@ -219,73 +190,7 @@ async def monitor_crash():
                 await procesar_crash(data)
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
-# ============================================
-# FUNCIONES SPACEMAN
-# ============================================
-async def monitor_spaceman():
-    global spaceman_last_multiplier, spaceman_history
-    reconnect_delay = BASE_RECONNECT_DELAY
-    logger.info("[SPACEMAN] 🚀 Iniciando monitor")
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(SPACEMAN_WS) as ws:
-                    logger.info("[SPACEMAN] ✅ WebSocket conectado")
-                    subscribe_msg = {
-                        "type": "subscribe",
-                        "casinoId": SPACEMAN_CASINO_ID,
-                        "currency": SPACEMAN_CURRENCY,
-                        "key": [SPACEMAN_GAME_ID]
-                    }
-                    await ws.send_json(subscribe_msg)
-                    logger.info("[SPACEMAN] 📡 Suscripción enviada")
-                    reconnect_delay = BASE_RECONNECT_DELAY
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = msg.json()
-                                if "gameResult" in data and data["gameResult"]:
-                                    result_str = data["gameResult"][0].get("result")
-                                    if result_str:
-                                        multiplier = float(result_str)
-                                        if multiplier >= 1.00 and multiplier != spaceman_last_multiplier:
-                                            spaceman_last_multiplier = multiplier
-                                            game_id = data.get("gameId", "unknown")
-                                            if game_id not in spaceman_events_seen:
-                                                spaceman_events_seen.add(game_id)
-                                                evento = {
-                                                    'event_id': game_id,
-                                                    'maxMultiplier': multiplier,
-                                                    'timestamp_recepcion': datetime.now().isoformat()
-                                                }
-                                                spaceman_history.insert(0, evento)
-                                                if len(spaceman_history) > MAX_HISTORY:
-                                                    spaceman_history.pop()
-                                                logger.info(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x")
-                                                await broadcast({
-                                                    'tipo': 'spaceman',
-                                                    'id': game_id,
-                                                    'maxMultiplier': multiplier,
-                                                    'timestamp_recepcion': evento['timestamp_recepcion']
-                                                })
-                                            else:
-                                                logger.info(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x")
-                            except (json.JSONDecodeError, KeyError, ValueError, IndexError):
-                                pass
-                        elif msg.type == aiohttp.WSMsgType.CLOSE:
-                            logger.info("[SPACEMAN] 🔌 Conexión cerrada")
-                            break
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            logger.error(f"[SPACEMAN] ❌ Error: {ws.exception()}")
-                            break
-        except Exception as e:
-            logger.error(f"[SPACEMAN] 💥 {e}, reconexión en {reconnect_delay:.1f}s")
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
-
-# ============================================
-# SERVIDOR WEB (HTTP + WebSocket)
-# ============================================
+# Servidor WebSocket
 connected_clients: Set[web.WebSocketResponse] = set()
 
 async def websocket_handler(request):
@@ -293,26 +198,18 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        # Enviar historial
         if crash_history:
             await ws.send_json({
                 'tipo': 'historial',
                 'api': 'crash',
                 'eventos': crash_history
             })
-        if spaceman_history:
-            await ws.send_json({
-                'tipo': 'historial',
-                'api': 'spaceman',
-                'eventos': spaceman_history
-            })
-        logger.info("Cliente WebSocket conectado, historial enviado")
+        logger.info("Cliente Crash conectado, historial enviado")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
     finally:
         connected_clients.remove(ws)
-        logger.info("Cliente WebSocket desconectado")
     return ws
 
 async def broadcast(event_data: Dict[str, Any]):
@@ -328,7 +225,7 @@ async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(text="Servidor Crash+Spaceman activo. Use /ws para WebSocket o /health para health check.", status=200)
+    return web.Response(text="Servidor Crash activo. Use /ws para WebSocket o /health para health check.", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -340,20 +237,16 @@ async def start_web_server():
     port = int(os.environ.get('PORT', 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"✅ Servidor HTTP/WebSocket escuchando en puerto {port}")
+    logger.info(f"✅ Servidor Crash escuchando en puerto {port}")
     await asyncio.Future()
 
-# ============================================
-# MAIN
-# ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor unificado CRASH + SPACEMAN con servidor HTTP/WebSocket")
+    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket")
     logger.info("=" * 60)
     tasks = [
-        asyncio.create_task(start_web_server(), name="HTTP"),
-        asyncio.create_task(monitor_crash(), name="Crash"),
-        asyncio.create_task(monitor_spaceman(), name="Spaceman"),
+        asyncio.create_task(start_web_server()),
+        asyncio.create_task(monitor_crash()),
     ]
     try:
         await asyncio.gather(*tasks)
@@ -362,7 +255,6 @@ async def main():
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("✅ Detenido")
 
 if __name__ == "__main__":
     asyncio.run(main())
