@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Monitor exclusivo para CRASH con servidor HTTP y WebSocket
+- Polling a la API de Stake Crash con headers sin Brotli
+- Envía historial a clientes WebSocket al conectar
+- Broadcast de nuevos eventos de Crash en lotes (máx 300)
+- Backoff exponencial y circuit breaker
+- Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
+"""
+
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -10,7 +19,7 @@ import random
 import logging
 import os
 from datetime import datetime
-from typing import Set, Dict, Any
+from typing import Set, Dict, Any, List
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,9 +28,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================
+# CONFIGURACIÓN CRASH
+# ============================================
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 
-# Lista ampliada de User-Agents (25)
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -43,11 +54,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
 BASE_SLEEP = 1.0
@@ -57,12 +63,39 @@ BLOCK_TIME = 300
 
 crash_ids: Set[str] = set()
 crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
-crash_history: list = []
+crash_history: List[Dict] = []
 MAX_HISTORY = 15000
-CHUNK_SIZE = 300
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
+# Batching settings
+BATCH_SIZE = 300
+BATCH_FLUSH_INTERVAL = 2.0
+event_batch: List[Dict] = []
+batch_lock = asyncio.Lock()
+
+# ============================================
+# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
+# ============================================
+async def self_ping():
+    """Hace una petición a /health cada 10 minutos para evitar que Render suspenda el servicio."""
+    port = int(os.environ.get('PORT', 10000))
+    url = f"http://localhost:{port}/health"
+    while True:
+        await asyncio.sleep(600)  # 10 minutos
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
+                    else:
+                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
+        except Exception as e:
+            logger.error(f"[PING] Error en auto‑ping: {e}")
+
+# ============================================
+# FUNCIONES CRASH
+# ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
@@ -79,7 +112,6 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
         await asyncio.sleep(wait)
         return None
 
-    # Headers sin 'br' para evitar dependencia de brotli (aunque lo tenemos instalado)
     headers = {
         'User-Agent': get_random_user_agent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -87,9 +119,6 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
         'Accept-Encoding': 'gzip, deflate',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'max-age=0',
-        'Referer': 'https://stake.com/',
-        'Origin': 'https://stake.com',
     }
 
     try:
@@ -175,8 +204,10 @@ async def procesar_crash(data: dict):
         crash_history.insert(0, evento)
         if len(crash_history) > MAX_HISTORY:
             crash_history.pop()
-        logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x")
-        await broadcast({
+        logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Inicio={started_at}")
+
+        # Add to batch instead of broadcasting immediately
+        await add_to_batch({
             'tipo': 'crash',
             'id': event_id,
             'maxMultiplier': max_mult,
@@ -194,17 +225,53 @@ async def monitor_crash():
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-            # Espera más larga (5-10 segundos) para reducir la tasa de peticiones
-            await asyncio.sleep(random.uniform(5.0, 10.0))
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
-async def broadcast(event_data: Dict[str, Any]):
+# ============================================
+# BATCH MANAGEMENT
+# ============================================
+async def add_to_batch(event: Dict[str, Any]):
+    """Add an event to the batch and flush if size threshold reached."""
+    global event_batch
+    async with batch_lock:
+        event_batch.append(event)
+        if len(event_batch) >= BATCH_SIZE:
+            await flush_batch()
+
+async def flush_batch():
+    """Send current batch to all connected clients and clear it."""
+    global event_batch
+    async with batch_lock:
+        if not event_batch:
+            return
+        batch_copy = event_batch[:]
+        event_batch.clear()
+    # Broadcast the batch
     if not connected_clients:
         return
-    message = json.dumps(event_data, default=str)
+    message = json.dumps({
+        'tipo': 'batch',
+        'api': 'crash',
+        'eventos': batch_copy
+    }, default=str)
     await asyncio.gather(
         *[client.send_str(message) for client in connected_clients],
         return_exceptions=True
     )
+    logger.debug(f"Batch flusheado: {len(batch_copy)} eventos")
+
+async def batch_flusher():
+    """Periodically flush the batch even if not full."""
+    while True:
+        await asyncio.sleep(BATCH_FLUSH_INTERVAL)
+        await flush_batch()
+
+# ============================================
+# SERVIDOR HTTP + WEBSOCKET (para clientes)
+# ============================================
+async def broadcast(event_data: Dict[str, Any]):
+    """Keep broadcast for backward compatibility (not used)."""
+    pass
 
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
@@ -212,24 +279,12 @@ async def websocket_handler(request):
     connected_clients.add(ws)
     try:
         if crash_history:
-            total = len(crash_history)
             await ws.send_json({
-                'tipo': 'historial_meta',
+                'tipo': 'historial',
                 'api': 'crash',
-                'total': total,
-                'chunk_size': CHUNK_SIZE
+                'eventos': crash_history
             })
-            for i in range(0, total, CHUNK_SIZE):
-                chunk = crash_history[i:i+CHUNK_SIZE]
-                await ws.send_json({
-                    'tipo': 'historial_chunk',
-                    'api': 'crash',
-                    'chunk': chunk,
-                    'chunk_index': i // CHUNK_SIZE,
-                    'total_chunks': (total + CHUNK_SIZE - 1) // CHUNK_SIZE
-                })
-                await asyncio.sleep(0.05)  # 50 ms entre lotes
-        logger.info("Cliente Crash conectado, historial enviado en lotes")
+        logger.info("Cliente Crash conectado, historial enviado")
         async for msg in ws:
             if msg.type == web.WSMsgType.CLOSE:
                 break
@@ -256,31 +311,23 @@ async def start_web_server():
     logger.info(f"✅ Servidor Crash escuchando en puerto {port}")
     await asyncio.Future()
 
-async def self_ping():
-    port = int(os.environ.get('PORT', 10000))
-    url = f"http://localhost:{port}/health"
-    while True:
-        await asyncio.sleep(600)  # 10 minutos
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        logger.debug("[PING] Auto‑ping exitoso")
-        except Exception:
-            pass
-
+# ============================================
+# MAIN
+# ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor CRASH con polling lento (5-10s) y envío de historial en lotes")
+    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket, batching y auto‑ping")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_crash()),
         asyncio.create_task(self_ping()),
+        asyncio.create_task(batch_flusher()),
     ]
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
+        logger.info("\n⏹ Deteniendo...")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
