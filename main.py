@@ -17,6 +17,7 @@ import time
 import random
 import os
 import logging
+from datetime import datetime  # <-- IMPORTACIÓN AÑADIDA
 from typing import Set, Dict, Any
 
 # ============================================
@@ -187,7 +188,6 @@ async def procesar_crash(data: dict):
     round_dur = result.get('roundDuration')
     started_at = data_inner.get('startedAt')
     if max_mult is not None and max_mult > 0:
-        timestamp = time.time()
         evento = {
             'event_id': event_id,
             'maxMultiplier': max_mult,
@@ -199,7 +199,6 @@ async def procesar_crash(data: dict):
         if len(crash_history) > MAX_HISTORY:
             crash_history.pop()
         logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Inicio={started_at}")
-        # Broadcast a clientes
         await broadcast({
             'tipo': 'crash',
             'id': event_id,
@@ -348,7 +347,6 @@ async def start_web_server():
 # MAIN
 # ============================================
 async def main():
-    from datetime import datetime
     logger.info("=" * 60)
     logger.info("🚀 Monitor unificado CRASH + SPACEMAN con servidor HTTP/WebSocket")
     logger.info("=" * 60)
