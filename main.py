@@ -4,7 +4,7 @@
 """
 Monitor exclusivo para CRASH con servidor HTTP y WebSocket
 - Polling a la API de Stake Crash con headers sin Brotli
-- Envía historial a clientes WebSocket al conectar
+- Envía historial a clientes WebSocket en fragmentos (500 por lote)
 - Broadcast de nuevos eventos de Crash en lotes (máx 300)
 - Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
@@ -67,12 +67,16 @@ crash_history: List[Dict] = []
 MAX_HISTORY = 15000
 
 connected_clients: Set[web.WebSocketResponse] = set()
+client_semaphore = asyncio.Semaphore(10)  # Max 10 concurrent clients
 
-# Batching settings
+# Batching settings for new events
 BATCH_SIZE = 300
 BATCH_FLUSH_INTERVAL = 2.0
 event_batch: List[Dict] = []
 batch_lock = asyncio.Lock()
+
+# History chunking settings
+HISTORY_CHUNK_SIZE = 500
 
 # ============================================
 # AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
@@ -228,10 +232,9 @@ async def monitor_crash():
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
 # ============================================
-# BATCH MANAGEMENT
+# BATCH MANAGEMENT (for new events)
 # ============================================
 async def add_to_batch(event: Dict[str, Any]):
-    """Add an event to the batch and flush if size threshold reached."""
     global event_batch
     async with batch_lock:
         event_batch.append(event)
@@ -239,14 +242,12 @@ async def add_to_batch(event: Dict[str, Any]):
             await flush_batch()
 
 async def flush_batch():
-    """Send current batch to all connected clients and clear it."""
     global event_batch
     async with batch_lock:
         if not event_batch:
             return
         batch_copy = event_batch[:]
         event_batch.clear()
-    # Broadcast the batch
     if not connected_clients:
         return
     message = json.dumps({
@@ -261,35 +262,55 @@ async def flush_batch():
     logger.debug(f"Batch flusheado: {len(batch_copy)} eventos")
 
 async def batch_flusher():
-    """Periodically flush the batch even if not full."""
     while True:
         await asyncio.sleep(BATCH_FLUSH_INTERVAL)
         await flush_batch()
 
 # ============================================
+# HISTORY CHUNKING (for initial client connection)
+# ============================================
+async def send_history_in_chunks(ws: web.WebSocketResponse, history: List[Dict]):
+    """Send the full history in chunks."""
+    total = len(history)
+    if total == 0:
+        await ws.send_json({'tipo': 'historial_start', 'total': 0})
+        await ws.send_json({'tipo': 'historial_end'})
+        return
+
+    await ws.send_json({'tipo': 'historial_start', 'total': total})
+
+    for i in range(0, total, HISTORY_CHUNK_SIZE):
+        chunk = history[i:i + HISTORY_CHUNK_SIZE]
+        await ws.send_json({
+            'tipo': 'historial_chunk',
+            'offset': i,
+            'chunk': chunk
+        })
+        # Small delay to avoid flooding the connection
+        await asyncio.sleep(0.01)
+
+    await ws.send_json({'tipo': 'historial_end'})
+
+# ============================================
 # SERVIDOR HTTP + WEBSOCKET (para clientes)
 # ============================================
-async def broadcast(event_data: Dict[str, Any]):
-    """Keep broadcast for backward compatibility (not used)."""
-    pass
-
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    connected_clients.add(ws)
-    try:
-        if crash_history:
-            await ws.send_json({
-                'tipo': 'historial',
-                'api': 'crash',
-                'eventos': crash_history
-            })
-        logger.info("Cliente Crash conectado, historial enviado")
-        async for msg in ws:
-            if msg.type == web.WSMsgType.CLOSE:
-                break
-    finally:
-        connected_clients.remove(ws)
+
+    # Limit concurrent clients
+    async with client_semaphore:
+        connected_clients.add(ws)
+        try:
+            # Send history in chunks
+            await send_history_in_chunks(ws, crash_history)
+            logger.info("Cliente Crash conectado, historial enviado en fragmentos")
+
+            async for msg in ws:
+                if msg.type == web.WSMsgType.CLOSE:
+                    break
+        finally:
+            connected_clients.remove(ws)
     return ws
 
 async def health_handler(request):
@@ -316,7 +337,7 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket, batching y auto‑ping")
+    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket, batching y fragmentación de historial")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
