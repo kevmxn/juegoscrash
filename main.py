@@ -3,9 +3,11 @@
 
 """
 Monitor exclusivo para CRASH con servidor HTTP y WebSocket
+- Polling a la API de Stake Crash con headers sin Brotli
 - Envía historial a clientes WebSocket al conectar
 - Broadcast de nuevos eventos de Crash
-- Headers sin Brotli, backoff exponencial, circuit breaker
+- Backoff exponencial y circuit breaker
+- Auto‑ping cada 10 minutos para evitar que Render suspenda el servicio
 """
 
 import asyncio
@@ -14,8 +16,8 @@ from aiohttp import web
 import json
 import time
 import random
-import os
 import logging
+import os
 from datetime import datetime
 from typing import Set, Dict, Any
 
@@ -26,6 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================
+# CONFIGURACIÓN CRASH
+# ============================================
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 
 USER_AGENTS = [
@@ -61,6 +66,30 @@ crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until'
 crash_history: list = []
 MAX_HISTORY = 15000
 
+connected_clients: Set[web.WebSocketResponse] = set()
+
+# ============================================
+# AUTO‑PING PARA MANTENER EL SERVICIO ACTIVO
+# ============================================
+async def self_ping():
+    """Hace una petición a /health cada 10 minutos para evitar que Render suspenda el servicio."""
+    port = int(os.environ.get('PORT', 10000))
+    url = f"http://localhost:{port}/health"
+    while True:
+        await asyncio.sleep(600)  # 10 minutos
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
+                    else:
+                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
+        except Exception as e:
+            logger.error(f"[PING] Error en auto‑ping: {e}")
+
+# ============================================
+# FUNCIONES CRASH
+# ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
@@ -190,8 +219,17 @@ async def monitor_crash():
                 await procesar_crash(data)
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
-# Servidor WebSocket
-connected_clients: Set[web.WebSocketResponse] = set()
+# ============================================
+# SERVIDOR HTTP + WEBSOCKET (para clientes)
+# ============================================
+async def broadcast(event_data: Dict[str, Any]):
+    if not connected_clients:
+        return
+    message = json.dumps(event_data, default=str)
+    await asyncio.gather(
+        *[client.send_str(message) for client in connected_clients],
+        return_exceptions=True
+    )
 
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
@@ -212,15 +250,6 @@ async def websocket_handler(request):
         connected_clients.remove(ws)
     return ws
 
-async def broadcast(event_data: Dict[str, Any]):
-    if not connected_clients:
-        return
-    message = json.dumps(event_data, default=str)
-    await asyncio.gather(
-        *[client.send_str(message) for client in connected_clients],
-        return_exceptions=True
-    )
-
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
@@ -240,13 +269,17 @@ async def start_web_server():
     logger.info(f"✅ Servidor Crash escuchando en puerto {port}")
     await asyncio.Future()
 
+# ============================================
+# MAIN
+# ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket")
+    logger.info("🚀 Monitor exclusivo de CRASH con WebSocket y auto‑ping")
     logger.info("=" * 60)
     tasks = [
         asyncio.create_task(start_web_server()),
         asyncio.create_task(monitor_crash()),
+        asyncio.create_task(self_ping()),
     ]
     try:
         await asyncio.gather(*tasks)
