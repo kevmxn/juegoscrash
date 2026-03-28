@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor unificado para CRASH (Stake) y SPACEMAN (Pragmatic Play)
-- Crash: polling HTTP con 20 User-Agents, backoff exponencial, circuit breaker y jitter.
-- Spaceman: conexión WebSocket persistente con reconexión automática.
+Monitor unificado CRASH + SPACEMAN con servidor HTTP para Render
+- Crash: polling HTTP robusto (20 user‑agents, backoff, circuit breaker)
+- Spaceman: WebSocket persistente con reconexión automática
+- Servidor HTTP en el puerto de Render con endpoint /health
 """
 
 import asyncio
 import aiohttp
+from aiohttp import web
 import json
 import time
 import random
@@ -73,17 +75,15 @@ def get_random_user_agent() -> str:
 async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
 
-    # Circuit breaker
     if now < crash_status['blocked_until']:
         wait = crash_status['blocked_until'] - now
-        print(f"[CRASH] 🚫 Bloqueado por {wait:.1f}s (demasiados errores)")
+        print(f"[CRASH] 🚫 Bloqueado por {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    # Backoff activo
     if now < crash_status['next_allowed_time']:
         wait = crash_status['next_allowed_time'] - now
-        print(f"[CRASH] ⏳ En espera por {wait:.1f}s (backoff)")
+        print(f"[CRASH] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
@@ -94,7 +94,7 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 retry_after = int(resp.headers['Retry-After'])
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
-                print(f"[CRASH] ⚠️ Servidor pide esperar {retry_after}s")
+                print(f"[CRASH] ⚠️ Esperar {retry_after}s (Retry-After)")
                 return None
 
             if resp.status == 200:
@@ -104,40 +104,37 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
-                print(f"[CRASH] ⚠️ Rate limit. Esperando {retry_after}s")
+                print(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s")
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                    print(f"[CRASH] 🔒 Bloqueado por {BLOCK_TIME}s por exceso de errores")
+                    print(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por errores")
                 return None
             elif 500 <= resp.status < 600:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
-                print(f"[CRASH] ❌ Error {resp.status}. Backoff {backoff:.1f}s")
+                print(f"[CRASH] ❌ Error {resp.status}, backoff {backoff:.1f}s")
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
                     crash_status['blocked_until'] = time.time() + BLOCK_TIME
-                    print(f"[CRASH] 🔒 Bloqueado por {BLOCK_TIME}s por exceso de errores")
                 return None
             else:
-                print(f"[CRASH] ⚠️ Código no esperado: {resp.status}")
+                print(f"[CRASH] ⚠️ Código inesperado {resp.status}")
                 return None
     except asyncio.TimeoutError:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
         crash_status['next_allowed_time'] = time.time() + backoff
-        print(f"[CRASH] ⏰ Timeout. Backoff {backoff:.1f}s")
+        print(f"[CRASH] ⏰ Timeout, backoff {backoff:.1f}s")
         if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
             crash_status['blocked_until'] = time.time() + BLOCK_TIME
-            print(f"[CRASH] 🔒 Bloqueado por {BLOCK_TIME}s por exceso de errores")
         return None
     except Exception as e:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
         crash_status['next_allowed_time'] = time.time() + backoff
-        print(f"[CRASH] 💥 Error: {e}. Backoff {backoff:.1f}s")
+        print(f"[CRASH] 💥 {e}, backoff {backoff:.1f}s")
         if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
             crash_status['blocked_until'] = time.time() + BLOCK_TIME
-            print(f"[CRASH] 🔒 Bloqueado por {BLOCK_TIME}s por exceso de errores")
         return None
 
 async def procesar_crash(data: dict):
@@ -155,16 +152,15 @@ async def procesar_crash(data: dict):
     if max_mult is not None and max_mult > 0:
         print(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Inicio={started_at}")
     else:
-        print(f"[CRASH] ⚠️ ID {event_id} con multiplicador inválido: {max_mult}")
+        print(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
 async def monitor_crash():
-    print("[CRASH] 🚀 Iniciando monitor de CRASH (Stake)")
+    print("[CRASH] 🚀 Iniciando")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-            # Espera aleatoria entre 0.5 y 1.5 segundos para evitar patrones
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
 # ============================================
@@ -173,15 +169,13 @@ async def monitor_crash():
 async def monitor_spaceman():
     global spaceman_last_multiplier
     reconnect_delay = BASE_RECONNECT_DELAY
-
-    print("[SPACEMAN] 🚀 Iniciando monitor de SPACEMAN (Pragmatic Play)")
+    print("[SPACEMAN] 🚀 Iniciando")
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(SPACEMAN_WS) as ws:
-                    print("[SPACEMAN] ✅ WebSocket conectado")
-
+                    print("[SPACEMAN] ✅ Conectado")
                     subscribe_msg = {
                         "type": "subscribe",
                         "casinoId": SPACEMAN_CASINO_ID,
@@ -190,7 +184,6 @@ async def monitor_spaceman():
                     }
                     await ws.send_json(subscribe_msg)
                     print("[SPACEMAN] 📡 Suscripción enviada")
-
                     reconnect_delay = BASE_RECONNECT_DELAY
 
                     async for msg in ws:
@@ -208,35 +201,50 @@ async def monitor_spaceman():
                                                 spaceman_events_seen.add(game_id)
                                                 print(f"[SPACEMAN] 🚀 NUEVO: GameID={game_id} | {multiplier:.2f}x")
                                             else:
-                                                print(f"[SPACEMAN] ⚠️ Duplicado: GameID={game_id} | {multiplier:.2f}x (ignorado)")
+                                                print(f"[SPACEMAN] ⚠️ Duplicado: {game_id} | {multiplier:.2f}x")
                             except (json.JSONDecodeError, KeyError, ValueError, IndexError):
                                 pass
                         elif msg.type == aiohttp.WSMsgType.CLOSE:
-                            print("[SPACEMAN] 🔌 Conexión cerrada por el servidor")
+                            print("[SPACEMAN] 🔌 Conexión cerrada")
                             break
                         elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print(f"[SPACEMAN] ❌ Error en WebSocket: {ws.exception()}")
+                            print(f"[SPACEMAN] ❌ Error: {ws.exception()}")
                             break
-
-        except asyncio.TimeoutError:
-            print(f"[SPACEMAN] ⏰ Timeout al conectar. Reintentando en {reconnect_delay:.1f}s")
-        except aiohttp.ClientError as e:
-            print(f"[SPACEMAN] 🔴 Error de cliente: {e}. Reintentando en {reconnect_delay:.1f}s")
         except Exception as e:
-            print(f"[SPACEMAN] 💥 Error inesperado: {e}. Reintentando en {reconnect_delay:.1f}s")
-
+            print(f"[SPACEMAN] 💥 {e}, reconexión en {reconnect_delay:.1f}s")
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
+
+# ============================================
+# SERVIDOR HTTP PARA RENDER (health check)
+# ============================================
+async def health_handler(request):
+    return web.Response(text="OK", status=200)
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get('/health', health_handler)
+    app.router.add_get('/', health_handler)  # raíz también responde
+    port = int(os.environ.get('PORT', 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"✅ Servidor HTTP escuchando en puerto {port} (endpoint /health)")
+    # Mantener vivo para siempre (no se detiene)
+    await asyncio.Future()
 
 # ============================================
 # MAIN
 # ============================================
 async def main():
     print("=" * 60)
-    print("🚀 Monitor unificado CRASH + SPACEMAN iniciado")
+    print("🚀 Monitor unificado CRASH + SPACEMAN con servidor HTTP")
     print("=" * 60)
 
+    # Lanzar tareas: servidor HTTP + monitores
     tasks = [
+        asyncio.create_task(start_http_server(), name="HTTP"),
         asyncio.create_task(monitor_crash(), name="Crash"),
         asyncio.create_task(monitor_spaceman(), name="Spaceman"),
     ]
@@ -244,11 +252,12 @@ async def main():
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        print("\n⏹ Deteniendo monitores...")
+        print("\n⏹ Deteniendo...")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        print("✅ Monitores detenidos.")
+        print("✅ Detenido")
 
 if __name__ == "__main__":
+    import os
     asyncio.run(main())
