@@ -664,8 +664,8 @@ async def monitor_crash():
     # Realizar warmup inicial si está habilitado
     if WARMUP_ENABLED:
         logger.info("[CRASH] 🔄 Realizando warmup inicial...")
-        async with aiohttp.ClientSession() as warmup_session:
-            await warmup_session(warmup_session)
+        async with aiohttp.ClientSession() as session_for_warmup:
+            await warmup_session(session_for_warmup)
 
     async with aiohttp.ClientSession() as session:
         while True:
