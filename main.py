@@ -9,8 +9,9 @@ Monitor exclusivo para CRASH con servidor HTTP y WebSocket
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
 - Persistencia con SQLite
-- Backoff exponencial y circuit breaker (estilo apis.py)
+- Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos
+- TLS fingerprint real de Chrome via curl_cffi (evita Cloudflare 403)
 """
 
 import asyncio
@@ -22,9 +23,17 @@ import random
 import logging
 import os
 from datetime import datetime
-from typing import Set, Dict, Any, List
+from typing import Set, List
 from collections import defaultdict
 import aiosqlite
+
+# ✅ curl_cffi impersona el TLS fingerprint de un browser real
+# pip install curl_cffi
+try:
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    USE_CURL_CFFI = True
+except ImportError:
+    USE_CURL_CFFI = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,60 +42,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+if not USE_CURL_CFFI:
+    logger.warning("⚠️  curl_cffi no instalado. Usando aiohttp (puede seguir dando 403). Instalar: pip install curl_cffi")
+
 # ============================================
 # CONFIGURACIÓN CRASH
 # ============================================
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 DB_PATH = "crash_data.db"
 
-# User Agents (predominantemente Windows, tomados de apis.py)
+# User Agents de Chrome (más creíbles para curl_cffi que también impersona Chrome)
 USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
-    "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:60.0) Gecko/20100101 Firefox/60.0",
-    "Mozilla/5.0 (Windows NT 6.1; rv:52.0) Gecko/20100101 Firefox/52.0",
-    "Mozilla/5.0 (Windows NT 5.1; rv:45.0) Gecko/20100101 Firefox/45.0",
-    "Mozilla/5.0 (Windows NT 5.1; rv:38.0) Gecko/20100101 Firefox/38.0",
-    "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko/20100101 Firefox/11.0",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
-    "Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:56.0) Gecko/20100101 Firefox/56.0",
-    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0 Waterfox/109.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Goanna/5.0 Firefox/78.0 PaleMoon/29.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
-    "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
-    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0)",
-    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E)",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
-    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0; .NET CLR 2.0.50727; .NET CLR 3.0.4506.2152; .NET CLR 3.5.30729)",
-    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
     "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
-    "Mozilla/5.0 (X11; Linux i686; rv:68.0) Gecko/20100101 Firefox/68.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0",
-    "Mozilla/5.0 (X11; Linux i686; rv:52.0) Gecko/20100101 Firefox/52.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
-    "Mozilla/5.0 (X11; Linux i686; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
-    "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
+]
+
+# Impersonaciones disponibles en curl_cffi
+CURL_IMPERSONATE = [
+    "chrome110", "chrome107", "chrome104", "chrome101",
+    "chrome100", "chrome99", "firefox102", "firefox100",
 ]
 
 BASE_SLEEP = 1.0
@@ -97,15 +79,14 @@ BLOCK_TIME = 300
 crash_ids: Set[str] = set()
 crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
 crash_history: list = []
-MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
-MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
+MAX_HISTORY = 100
+MAX_STORAGE = 100000
 
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
-# Batching
 event_queue = asyncio.Queue()
 BATCH_SIZE = 20
 BATCH_TIMEOUT = 1.0
@@ -147,8 +128,10 @@ async def init_db():
 async def load_from_db():
     global crash_history, crash_ids, level_counts, current_level
     async with aiosqlite.connect(DB_PATH) as db:
-        # Cargar últimos 100 eventos en memoria
-        async with db.execute('SELECT id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
+        async with db.execute(
+            'SELECT id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel '
+            'FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)
+        ) as cursor:
             rows = await cursor.fetchall()
             crash_history = []
             crash_ids.clear()
@@ -163,7 +146,6 @@ async def load_from_db():
                 }
                 crash_history.append(event)
                 crash_ids.add(row[0])
-        # Cargar contadores y estado
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
             level_counts.clear()
@@ -183,8 +165,11 @@ async def save_event(event: dict):
         await db.execute('''
             INSERT OR REPLACE INTO events (id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (event['event_id'], event['maxMultiplier'], event.get('roundDuration'), event.get('startedAt'), event['timestamp_recepcion'], event['nivel']))
-        # Mantener solo los últimos MAX_STORAGE eventos en BD
+        ''', (
+            event['event_id'], event['maxMultiplier'],
+            event.get('roundDuration'), event.get('startedAt'),
+            event['timestamp_recepcion'], event['nivel']
+        ))
         await db.execute('''
             DELETE FROM events WHERE id NOT IN (
                 SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
@@ -202,9 +187,10 @@ async def update_count(level: int, range_key: str):
 
 async def update_current_level(level: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)
-        ''', ('current_level', str(level)))
+        await db.execute(
+            'INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)',
+            ('current_level', str(level))
+        )
         await db.commit()
 
 # ============================================
@@ -217,7 +203,7 @@ async def self_ping():
         await asyncio.sleep(600)
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         logger.info("[PING] Auto‑ping exitoso, servicio activo")
                     else:
@@ -247,11 +233,7 @@ async def batch_sender():
 async def send_batch(events_list: List[dict]):
     if not connected_clients:
         return
-    batch_msg = {
-        'tipo': 'batch',
-        'eventos': events_list
-    }
-    message = json.dumps(batch_msg, default=str)
+    message = json.dumps({'tipo': 'batch', 'eventos': events_list}, default=str)
     await asyncio.gather(
         *[client.send_str(message) for client in connected_clients],
         return_exceptions=True
@@ -267,12 +249,11 @@ async def periodic_table_sender():
         await asyncio.sleep(interval)
         if not connected_clients:
             continue
-        table_msg = {
+        message = json.dumps({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
             'conteos': {k: dict(v) for k, v in level_counts.items()}
-        }
-        message = json.dumps(table_msg, default=str)
+        }, default=str)
         await asyncio.gather(
             *[client.send_str(message) for client in connected_clients],
             return_exceptions=True
@@ -280,22 +261,14 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# FUNCIONES CRASH (con backoff tipo apis.py)
+# FUNCIONES CRASH
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
-async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
-    now = time.time()
-    if now < crash_status['next_allowed_time']:
-        wait = crash_status['next_allowed_time'] - now
-        if wait > 0.5:
-            logger.debug(f"[CRASH] ⏳ Backoff {wait:.1f}s")
-        await asyncio.sleep(wait)
-        return None
-
-    # ✅ FIX: Headers completos para evitar detección de bot y reducir 403
-    headers = {
+def _build_headers() -> dict:
+    """Headers que imitan un browser real haciendo un fetch de API."""
+    return {
         'User-Agent': get_random_user_agent(),
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
@@ -310,58 +283,98 @@ async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
         'Pragma': 'no-cache',
     }
 
-    try:
-        async with session.get(API_CRASH, headers=headers, timeout=10) as resp:
-            if 'Retry-After' in resp.headers:
-                retry_after = int(resp.headers['Retry-After'])
-                crash_status['next_allowed_time'] = time.time() + retry_after
-                crash_status['consecutive_errors'] += 1
-                logger.warning(f"[CRASH] ⚠️ Retry-After {retry_after}s ({crash_status['consecutive_errors']} errores consecutivos)")
-                return None
-
-            if resp.status == 200:
-                crash_status['consecutive_errors'] = 0
-                return await resp.json()
-
-            elif resp.status == 403:
-                crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + backoff
-                logger.warning(f"[CRASH] 🚫 403 Forbidden - Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
-                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por {crash_status['consecutive_errors']} errores consecutivos")
-                return None
-
-            elif resp.status == 429:
-                retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + retry_after
-                crash_status['consecutive_errors'] += 1
-                logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s ({crash_status['consecutive_errors']} errores consecutivos)")
-                return None
-
-            elif 500 <= resp.status < 600:
-                crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + backoff
-                logger.error(f"[CRASH] ❌ Error {resp.status}, Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
-                return None
-
-            else:
-                logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
-                return None
-
-    except asyncio.TimeoutError:
-        crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
+def _registrar_error(descripcion: str):
+    """Incrementa errores consecutivos y aplica backoff."""
+    crash_status['consecutive_errors'] += 1
+    n = crash_status['consecutive_errors']
+    backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** n))
+    if n >= MAX_CONSECUTIVE_ERRORS:
+        crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
+        logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s ({n} errores consecutivos) - {descripcion}")
+    else:
         crash_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"[CRASH] ⏰ Timeout, Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
+        logger.warning(f"[CRASH] {descripcion} - Backoff {backoff:.1f}s ({n} errores consecutivos)")
+
+# -----------------------------------------------
+# CONSULTA con curl_cffi (impersonación TLS real)
+# -----------------------------------------------
+async def _consultar_con_curl() -> dict | None:
+    impersonate = random.choice(CURL_IMPERSONATE)
+    async with CurlAsyncSession(impersonate=impersonate) as session:
+        resp = await session.get(API_CRASH, headers=_build_headers(), timeout=10)
+        if resp.status_code == 200:
+            crash_status['consecutive_errors'] = 0
+            return resp.json()
+        elif resp.status_code == 403:
+            _registrar_error(f"🚫 403 Forbidden [impersonate={impersonate}]")
+            return None
+        elif resp.status_code == 429:
+            retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
+            crash_status['consecutive_errors'] += 1
+            crash_status['next_allowed_time'] = time.time() + retry_after
+            logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s ({crash_status['consecutive_errors']} errores)")
+            return None
+        elif 500 <= resp.status_code < 600:
+            _registrar_error(f"❌ Error {resp.status_code}")
+            return None
+        else:
+            logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status_code}")
+            return None
+
+# -----------------------------------------------
+# CONSULTA fallback con aiohttp
+# -----------------------------------------------
+async def _consultar_con_aiohttp(session: aiohttp.ClientSession) -> dict | None:
+    async with session.get(
+        API_CRASH, headers=_build_headers(), timeout=aiohttp.ClientTimeout(total=10)
+    ) as resp:
+        if 'Retry-After' in resp.headers:
+            retry_after = int(resp.headers['Retry-After'])
+            crash_status['consecutive_errors'] += 1
+            crash_status['next_allowed_time'] = time.time() + retry_after
+            logger.warning(f"[CRASH] ⚠️ Retry-After {retry_after}s ({crash_status['consecutive_errors']} errores)")
+            return None
+        if resp.status == 200:
+            crash_status['consecutive_errors'] = 0
+            return await resp.json()
+        elif resp.status == 403:
+            _registrar_error("🚫 403 Forbidden [aiohttp]")
+            return None
+        elif resp.status == 429:
+            retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
+            crash_status['consecutive_errors'] += 1
+            crash_status['next_allowed_time'] = time.time() + retry_after
+            logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s")
+            return None
+        elif 500 <= resp.status < 600:
+            _registrar_error(f"❌ Error {resp.status}")
+            return None
+        else:
+            logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
+            return None
+
+# -----------------------------------------------
+# CONSULTA principal
+# -----------------------------------------------
+async def consultar_crash(aiohttp_session: aiohttp.ClientSession) -> dict | None:
+    now = time.time()
+    if now < crash_status['next_allowed_time']:
+        wait = crash_status['next_allowed_time'] - now
+        if wait > 0.5:
+            logger.debug(f"[CRASH] ⏳ En backoff, esperando {wait:.1f}s")
+        await asyncio.sleep(wait)
+        return None
+
+    try:
+        if USE_CURL_CFFI:
+            return await _consultar_con_curl()
+        else:
+            return await _consultar_con_aiohttp(aiohttp_session)
+    except asyncio.TimeoutError:
+        _registrar_error("⏰ Timeout")
         return None
     except Exception as e:
-        crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-        crash_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"[CRASH] 💥 Excepción: {e}, Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
+        _registrar_error(f"💥 Excepción: {e}")
         return None
 
 async def procesar_crash(data: dict):
@@ -375,14 +388,13 @@ async def procesar_crash(data: dict):
     max_mult = result.get('maxMultiplier')
     round_dur = result.get('roundDuration')
     started_at = data_inner.get('startedAt')
+
     if max_mult is not None and max_mult > 0:
-        # Actualizar nivel
         if max_mult < 2.00:
             current_level -= 1
         else:
             current_level += 1
 
-        # Determinar rango
         range_key = None
         if 3.00 <= max_mult <= 4.99:
             range_key = '3-4.99'
@@ -401,14 +413,12 @@ async def procesar_crash(data: dict):
             'nivel': current_level
         }
 
-        # Actualizar memoria (últimos 100 eventos)
         crash_history.insert(0, evento)
         if len(crash_history) > MAX_HISTORY:
             crash_history.pop()
         if range_key:
             level_counts[current_level][range_key] += 1
 
-        # Guardar en BD (almacena hasta MAX_STORAGE)
         await save_event(evento)
         if range_key:
             await update_count(current_level, range_key)
@@ -421,16 +431,15 @@ async def procesar_crash(data: dict):
 
 async def monitor_crash():
     logger.info("[CRASH] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
+    logger.info(f"[CRASH] Modo TLS: {'curl_cffi ✅' if USE_CURL_CFFI else 'aiohttp ⚠️'}")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-                # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
                 sleep_time = random.uniform(1.5, 2.5)
                 await asyncio.sleep(sleep_time)
             else:
-                # Si falló, el backoff ya esperó; añadimos 1s extra para no saturar
                 await asyncio.sleep(1)
 
 # ============================================
@@ -457,14 +466,17 @@ async def websocket_handler(request):
             if msg.type == web.WSMsgType.CLOSE:
                 break
     finally:
-        connected_clients.discard(ws)  # ✅ FIX: discard evita KeyError si ya fue removido
+        connected_clients.discard(ws)
     return ws
 
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(text="Servidor Crash activo. Use /ws para WebSocket o /health para health check.", status=200)
+    return web.Response(
+        text="Servidor Crash activo. Use /ws para WebSocket o /health para health check.",
+        status=200
+    )
 
 async def start_web_server():
     app = web.Application()
@@ -484,7 +496,8 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor Crash con almacenamiento 100k eventos, envío últimos 100")
+    logger.info("🚀 Monitor Crash - 100k eventos, envío últimos 100")
+    logger.info(f"   TLS Mode: {'curl_cffi ✅' if USE_CURL_CFFI else 'aiohttp ⚠️  → instalar: pip install curl_cffi'}")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
