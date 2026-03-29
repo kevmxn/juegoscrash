@@ -3,15 +3,13 @@
 
 """
 Monitor exclusivo para CRASH con servidor HTTP y WebSocket
-- Polling a la API de Stake Crash
+- Polling a la API de Stake Crash con cloudscraper (bypass Cloudflare)
 - Almacena hasta 100,000 eventos en SQLite
 - Envía solo los últimos 100 eventos al conectar
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
-- Persistencia con SQLite
 - Backoff exponencial y circuit breaker
 - Auto‑ping cada 10 minutos
-- TLS fingerprint real de Chrome via curl_cffi (evita Cloudflare 403)
 """
 
 import asyncio
@@ -27,13 +25,20 @@ from typing import Set, List
 from collections import defaultdict
 import aiosqlite
 
-# ✅ curl_cffi impersona el TLS fingerprint de un browser real
-# pip install curl_cffi
+# ✅ cloudscraper maneja cookies y JS challenges de Cloudflare
+# pip install cloudscraper
 try:
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
-    USE_CURL_CFFI = True
+    import cloudscraper
+    _scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        }
+    )
+    USE_CLOUDSCRAPER = True
 except ImportError:
-    USE_CURL_CFFI = False
+    USE_CLOUDSCRAPER = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,34 +47,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-if not USE_CURL_CFFI:
-    logger.warning("⚠️  curl_cffi no instalado. Usando aiohttp (puede seguir dando 403). Instalar: pip install curl_cffi")
+if not USE_CLOUDSCRAPER:
+    logger.warning("⚠️  cloudscraper no instalado. Instalar: pip install cloudscraper")
 
 # ============================================
 # CONFIGURACIÓN CRASH
 # ============================================
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 DB_PATH = "crash_data.db"
-
-# User Agents de Chrome (más creíbles para curl_cffi que también impersona Chrome)
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-]
-
-# Impersonaciones disponibles en curl_cffi
-CURL_IMPERSONATE = [
-    "chrome110", "chrome107", "chrome104", "chrome101",
-    "chrome100", "chrome99", "firefox102", "firefox100",
-]
 
 BASE_SLEEP = 1.0
 MAX_SLEEP = 60.0
@@ -95,7 +80,7 @@ TABLE_UPDATE_MIN = 60
 TABLE_UPDATE_MAX = 120
 
 # ============================================
-# FUNCIONES DE BASE DE DATOS
+# BASE DE DATOS
 # ============================================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -136,15 +121,11 @@ async def load_from_db():
             crash_history = []
             crash_ids.clear()
             for row in rows:
-                event = {
-                    'event_id': row[0],
-                    'maxMultiplier': row[1],
-                    'roundDuration': row[2],
-                    'startedAt': row[3],
-                    'timestamp_recepcion': row[4],
-                    'nivel': row[5]
-                }
-                crash_history.append(event)
+                crash_history.append({
+                    'event_id': row[0], 'maxMultiplier': row[1],
+                    'roundDuration': row[2], 'startedAt': row[3],
+                    'timestamp_recepcion': row[4], 'nivel': row[5]
+                })
                 crash_ids.add(row[0])
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
@@ -157,7 +138,7 @@ async def load_from_db():
                 current_level = int(row[0])
             else:
                 current_level = 0
-                await db.execute('INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)', ('current_level', '0'))
+                await db.execute('INSERT OR IGNORE INTO state VALUES (?, ?)', ('current_level', '0'))
                 await db.commit()
 
 async def save_event(event: dict):
@@ -187,10 +168,7 @@ async def update_count(level: int, range_key: str):
 
 async def update_current_level(level: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            'INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)',
-            ('current_level', str(level))
-        )
+        await db.execute('INSERT OR REPLACE INTO state VALUES (?, ?)', ('current_level', str(level)))
         await db.commit()
 
 # ============================================
@@ -205,11 +183,11 @@ async def self_ping():
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
+                        logger.info("[PING] Auto‑ping exitoso")
                     else:
-                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
+                        logger.warning(f"[PING] Falló con código {resp.status}")
         except Exception as e:
-            logger.error(f"[PING] Error en auto‑ping: {e}")
+            logger.error(f"[PING] Error: {e}")
 
 # ============================================
 # BATCH SENDER
@@ -261,101 +239,63 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# FUNCIONES CRASH
+# CONSULTA CRASH
 # ============================================
-def get_random_user_agent() -> str:
-    return random.choice(USER_AGENTS)
-
-def _build_headers() -> dict:
-    """Headers que imitan un browser real haciendo un fetch de API."""
-    return {
-        'User-Agent': get_random_user_agent(),
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Origin': 'https://stake.com',
-        'Referer': 'https://stake.com/',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'cross-site',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-    }
-
 def _registrar_error(descripcion: str):
-    """Incrementa errores consecutivos y aplica backoff."""
     crash_status['consecutive_errors'] += 1
     n = crash_status['consecutive_errors']
     backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** n))
     if n >= MAX_CONSECUTIVE_ERRORS:
         crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
-        logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s ({n} errores consecutivos) - {descripcion}")
+        logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s ({n} errores) - {descripcion}")
     else:
         crash_status['next_allowed_time'] = time.time() + backoff
         logger.warning(f"[CRASH] {descripcion} - Backoff {backoff:.1f}s ({n} errores consecutivos)")
 
-# -----------------------------------------------
-# CONSULTA con curl_cffi (impersonación TLS real)
-# -----------------------------------------------
-async def _consultar_con_curl() -> dict | None:
-    impersonate = random.choice(CURL_IMPERSONATE)
-    async with CurlAsyncSession(impersonate=impersonate) as session:
-        resp = await session.get(API_CRASH, headers=_build_headers(), timeout=10)
+def _hacer_request_sync() -> tuple[int, dict | None]:
+    """
+    Ejecuta la petición HTTP de forma síncrona con cloudscraper.
+    Retorna (status_code, json_data_o_None).
+    """
+    try:
+        resp = _scraper.get(
+            API_CRASH,
+            headers={
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Origin': 'https://stake.com',
+                'Referer': 'https://stake.com/',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'cross-site',
+            },
+            timeout=15
+        )
         if resp.status_code == 200:
-            crash_status['consecutive_errors'] = 0
-            return resp.json()
-        elif resp.status_code == 403:
-            _registrar_error(f"🚫 403 Forbidden [impersonate={impersonate}]")
-            return None
-        elif resp.status_code == 429:
-            retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
-            crash_status['consecutive_errors'] += 1
-            crash_status['next_allowed_time'] = time.time() + retry_after
-            logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s ({crash_status['consecutive_errors']} errores)")
-            return None
-        elif 500 <= resp.status_code < 600:
-            _registrar_error(f"❌ Error {resp.status_code}")
-            return None
-        else:
-            logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status_code}")
-            return None
+            return 200, resp.json()
+        return resp.status_code, None
+    except Exception as e:
+        return -1, None
 
-# -----------------------------------------------
-# CONSULTA fallback con aiohttp
-# -----------------------------------------------
-async def _consultar_con_aiohttp(session: aiohttp.ClientSession) -> dict | None:
-    async with session.get(
-        API_CRASH, headers=_build_headers(), timeout=aiohttp.ClientTimeout(total=10)
-    ) as resp:
-        if 'Retry-After' in resp.headers:
-            retry_after = int(resp.headers['Retry-After'])
-            crash_status['consecutive_errors'] += 1
-            crash_status['next_allowed_time'] = time.time() + retry_after
-            logger.warning(f"[CRASH] ⚠️ Retry-After {retry_after}s ({crash_status['consecutive_errors']} errores)")
-            return None
-        if resp.status == 200:
-            crash_status['consecutive_errors'] = 0
-            return await resp.json()
-        elif resp.status == 403:
-            _registrar_error("🚫 403 Forbidden [aiohttp]")
-            return None
-        elif resp.status == 429:
-            retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
-            crash_status['consecutive_errors'] += 1
-            crash_status['next_allowed_time'] = time.time() + retry_after
-            logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s")
-            return None
-        elif 500 <= resp.status < 600:
-            _registrar_error(f"❌ Error {resp.status}")
-            return None
-        else:
-            logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
-            return None
+async def _hacer_request_aiohttp(session: aiohttp.ClientSession) -> tuple[int, dict | None]:
+    """Fallback con aiohttp si cloudscraper no está disponible."""
+    try:
+        async with session.get(
+            API_CRASH,
+            headers={
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Origin': 'https://stake.com',
+                'Referer': 'https://stake.com/',
+            },
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status == 200:
+                return 200, await resp.json()
+            return resp.status, None
+    except Exception:
+        return -1, None
 
-# -----------------------------------------------
-# CONSULTA principal
-# -----------------------------------------------
 async def consultar_crash(aiohttp_session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
     if now < crash_status['next_allowed_time']:
@@ -365,18 +305,31 @@ async def consultar_crash(aiohttp_session: aiohttp.ClientSession) -> dict | None
         await asyncio.sleep(wait)
         return None
 
-    try:
-        if USE_CURL_CFFI:
-            return await _consultar_con_curl()
-        else:
-            return await _consultar_con_aiohttp(aiohttp_session)
-    except asyncio.TimeoutError:
-        _registrar_error("⏰ Timeout")
-        return None
-    except Exception as e:
-        _registrar_error(f"💥 Excepción: {e}")
-        return None
+    # cloudscraper es síncrono → ejecutar en thread pool para no bloquear el event loop
+    if USE_CLOUDSCRAPER:
+        loop = asyncio.get_event_loop()
+        status, data = await loop.run_in_executor(None, _hacer_request_sync)
+    else:
+        status, data = await _hacer_request_aiohttp(aiohttp_session)
 
+    if status == 200:
+        crash_status['consecutive_errors'] = 0
+        return data
+    elif status == 403:
+        _registrar_error("🚫 403 Forbidden")
+    elif status == 429:
+        _registrar_error("⚠️ 429 Rate Limit")
+    elif 500 <= status < 600:
+        _registrar_error(f"❌ Error {status}")
+    elif status == -1:
+        _registrar_error("💥 Excepción / Timeout")
+    else:
+        logger.warning(f"[CRASH] ⚠️ Código inesperado: {status}")
+    return None
+
+# ============================================
+# PROCESAMIENTO
+# ============================================
 async def procesar_crash(data: dict):
     global current_level, crash_history, level_counts
     event_id = data.get('id')
@@ -389,56 +342,53 @@ async def procesar_crash(data: dict):
     round_dur = result.get('roundDuration')
     started_at = data_inner.get('startedAt')
 
-    if max_mult is not None and max_mult > 0:
-        if max_mult < 2.00:
-            current_level -= 1
-        else:
-            current_level += 1
-
-        range_key = None
-        if 3.00 <= max_mult <= 4.99:
-            range_key = '3-4.99'
-        elif 5.00 <= max_mult <= 9.99:
-            range_key = '5-9.99'
-        elif max_mult >= 10.00:
-            range_key = '10+'
-
-        evento = {
-            'tipo': 'crash',
-            'event_id': event_id,
-            'maxMultiplier': max_mult,
-            'roundDuration': round_dur,
-            'startedAt': started_at,
-            'timestamp_recepcion': datetime.now().isoformat(),
-            'nivel': current_level
-        }
-
-        crash_history.insert(0, evento)
-        if len(crash_history) > MAX_HISTORY:
-            crash_history.pop()
-        if range_key:
-            level_counts[current_level][range_key] += 1
-
-        await save_event(evento)
-        if range_key:
-            await update_count(current_level, range_key)
-        await update_current_level(current_level)
-
-        logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Inicio={started_at} | Nivel={current_level}")
-        await event_queue.put(evento)
-    else:
+    if max_mult is None or max_mult <= 0:
         logger.warning(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
+        return
+
+    current_level += 1 if max_mult >= 2.00 else -1
+
+    range_key = None
+    if 3.00 <= max_mult <= 4.99:
+        range_key = '3-4.99'
+    elif 5.00 <= max_mult <= 9.99:
+        range_key = '5-9.99'
+    elif max_mult >= 10.00:
+        range_key = '10+'
+
+    evento = {
+        'tipo': 'crash',
+        'event_id': event_id,
+        'maxMultiplier': max_mult,
+        'roundDuration': round_dur,
+        'startedAt': started_at,
+        'timestamp_recepcion': datetime.now().isoformat(),
+        'nivel': current_level
+    }
+
+    crash_history.insert(0, evento)
+    if len(crash_history) > MAX_HISTORY:
+        crash_history.pop()
+    if range_key:
+        level_counts[current_level][range_key] += 1
+
+    await save_event(evento)
+    if range_key:
+        await update_count(current_level, range_key)
+    await update_current_level(current_level)
+
+    logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Nivel={current_level}")
+    await event_queue.put(evento)
 
 async def monitor_crash():
-    logger.info("[CRASH] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
-    logger.info(f"[CRASH] Modo TLS: {'curl_cffi ✅' if USE_CURL_CFFI else 'aiohttp ⚠️'}")
+    modo = 'cloudscraper ✅' if USE_CLOUDSCRAPER else 'aiohttp ⚠️ (instalar cloudscraper)'
+    logger.info(f"[CRASH] 🚀 Iniciando monitor | Modo: {modo}")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-                sleep_time = random.uniform(1.5, 2.5)
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(random.uniform(1.5, 2.5))
             else:
                 await asyncio.sleep(1)
 
@@ -451,11 +401,7 @@ async def websocket_handler(request):
     connected_clients.add(ws)
     try:
         if crash_history:
-            await ws.send_json({
-                'tipo': 'historial',
-                'api': 'crash',
-                'eventos': crash_history
-            })
+            await ws.send_json({'tipo': 'historial', 'api': 'crash', 'eventos': crash_history})
         await ws.send_json({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
@@ -497,7 +443,7 @@ async def start_web_server():
 async def main():
     logger.info("=" * 60)
     logger.info("🚀 Monitor Crash - 100k eventos, envío últimos 100")
-    logger.info(f"   TLS Mode: {'curl_cffi ✅' if USE_CURL_CFFI else 'aiohttp ⚠️  → instalar: pip install curl_cffi'}")
+    logger.info(f"   CF Bypass: {'cloudscraper ✅' if USE_CLOUDSCRAPER else 'aiohttp ⚠️  → pip install cloudscraper'}")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
