@@ -47,8 +47,9 @@ DB_PATH = "crash_data.db"
 # PROXIES ROTATIVOS
 # Agregar tus proxies aquí en formato: "http://user:pass@ip:port"
 PROXIES = [
-    # "http://user:pass@ip1:port",
-    # "http://user:pass@ip2:port",
+    "http://usuario:password@45.123.456.78:8080",
+    "http://usuario:password@45.123.456.79:8080",
+    "http://usuario:password@45.123.456.80:8080",
 ]
 
 # Estado de proxies: contador de fallos y tiempo de bloqueo
