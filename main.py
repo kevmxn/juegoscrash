@@ -11,7 +11,6 @@ Monitor exclusivo para CRASH con servidor HTTP y WebSocket
 - Persistencia con SQLite
 - Backoff exponencial y circuit breaker (estilo apis.py)
 - Auto‑ping cada 10 minutos
-- ANTI-BLOQUEO: Proxies rotativos, headers realistas, warmup, backoff inteligente
 """
 
 import asyncio
@@ -23,7 +22,7 @@ import random
 import logging
 import os
 from datetime import datetime
-from typing import Set, Dict, Any, List, Optional
+from typing import Set, Dict, Any, List
 from collections import defaultdict
 import aiosqlite
 
@@ -40,154 +39,7 @@ logger = logging.getLogger(__name__)
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 DB_PATH = "crash_data.db"
 
-# ============================================
-# CONFIGURACIÓN ANTI-BLOQUEO
-# ============================================
-
-# PROXIES ROTATIVOS
-# Agregar tus proxies aquí en formato: "http://user:pass@ip:port"
-PROXIES = [
-    "http://usuario:password@45.123.456.78:8080",
-    "http://usuario:password@45.123.456.79:8080",
-    "http://usuario:password@45.123.456.80:8080",
-]
-
-# Estado de proxies: contador de fallos y tiempo de bloqueo
-proxy_status: Dict[str, Dict[str, Any]] = {
-    p: {"fails": 0, "blocked_until": 0, "successes": 0}
-    for p in PROXIES
-}
-
-# Configuración de bloqueo de proxies
-MAX_PROXY_FAILS = 3          # Fallos antes de bloquear
-PROXY_BLOCK_DURATION = 600   # 10 minutos de bloqueo
-PROXY_RECOVERY_RATE = 0.3    # 30% de probabilidad de probar proxy bloqueado
-
-def get_healthy_proxy() -> Optional[str]:
-    """Obtiene un proxy saludable (no bloqueado)"""
-    now = time.time()
-    valid = [p for p, s in proxy_status.items() if s["blocked_until"] < now]
-
-    if not valid and PROXIES:
-        # Si todos los proxies están bloqueados, probar uno al azar con baja probabilidad
-        if random.random() < PROXY_RECOVERY_RATE:
-            logger.warning("[PROXY] Todos los proxies bloqueados, probando uno al azar")
-            return random.choice(PROXIES)
-        return None
-
-    return random.choice(valid) if valid else None
-
-def mark_proxy_success(proxy: str):
-    """Marca un proxy como exitoso, resetea contador de errores"""
-    if proxy in proxy_status:
-        proxy_status[proxy]["fails"] = 0
-        proxy_status[proxy]["successes"] += 1
-        logger.debug(f"[PROXY] ✅ {proxy} - Éxitos: {proxy_status[proxy]['successes']}")
-
-def mark_proxy_failed(proxy: str):
-    """Marca un proxy como fallido, bloquea si supera el límite"""
-    if proxy not in proxy_status:
-        return
-
-    proxy_status[proxy]["fails"] += 1
-    fails = proxy_status[proxy]["fails"]
-
-    if fails >= MAX_PROXY_FAILS:
-        proxy_status[proxy]["blocked_until"] = time.time() + PROXY_BLOCK_DURATION
-        logger.warning(f"[PROXY] 🚫 {proxy} bloqueado por {PROXY_BLOCK_DURATION}s ({fails} fallos)")
-    else:
-        logger.warning(f"[PROXY] ⚠️ {proxy} - Fallo {fails}/{MAX_PROXY_FAILS}")
-
-def get_proxy_stats() -> Dict[str, Any]:
-    """Obtiene estadísticas de uso de proxies"""
-    return {
-        proxy: {
-            "fails": status["fails"],
-            "successes": status["successes"],
-            "blocked": status["blocked_until"] > time.time(),
-            "blocked_until": status["blocked_until"] if status["blocked_until"] > time.time() else 0
-        }
-        for proxy, status in proxy_status.items()
-    }
-
-# HEADER PROFILES - Headers realistas y rotativos
-HEADER_PROFILES = [
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://stake.com/",
-        "Origin": "https://stake.com",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    },
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "Accept": "*/*",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://stake.com/casino/games/crash",
-        "Origin": "https://stake.com",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    },
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://stake.com/",
-        "Origin": "https://stake.com",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-    },
-    {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://stake.com/casino/games/crash",
-        "Origin": "https://stake.com",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    },
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9,es;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://stake.com/",
-        "Origin": "https://stake.com",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "DNT": "1",
-    },
-]
-
-def get_random_headers() -> Dict[str, str]:
-    """Obtiene headers rotativos realistas"""
-    headers = random.choice(HEADER_PROFILES).copy()
-    # Rotar User-Agent independientemente para másvariedad
-    headers["User-Agent"] = random.choice(USER_AGENTS)
-    return headers
-
-# User Agents (predominantemente Windows)
+# User Agents (predominantemente Windows, tomados de apis.py)
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
@@ -196,13 +48,45 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
     "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (Windows NT 6.1; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko/20100101 Firefox/11.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
+    "Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:56.0) Gecko/20100101 Firefox/56.0",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0 Waterfox/109.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Goanna/5.0 Firefox/78.0 PaleMoon/29.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E)",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0; .NET CLR 2.0.50727; .NET CLR 3.0.4506.2152; .NET CLR 3.5.30729)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
     "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (X11; Linux i686; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
 ]
 
 BASE_SLEEP = 1.0
@@ -210,13 +94,8 @@ MAX_SLEEP = 60.0
 MAX_CONSECUTIVE_ERRORS = 10
 BLOCK_TIME = 300
 
-# Configuración de warmup
-WARMUP_ENABLED = True
-WARMUP_INTERVAL = 30  # Hacer warmup cada N запросов
-WARMUP_URL = "https://stake.com"
-
 crash_ids: Set[str] = set()
-crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'request_count': 0}
+crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
 crash_history: list = []
 MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
 MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
@@ -233,9 +112,6 @@ BATCH_TIMEOUT = 1.0
 
 TABLE_UPDATE_MIN = 60
 TABLE_UPDATE_MAX = 120
-
-# Cookies compartidas para simular sesión real
-shared_cookies: Dict[str, str] = {}
 
 # ============================================
 # FUNCIONES DE BASE DE DATOS
@@ -332,32 +208,6 @@ async def update_current_level(level: int):
         await db.commit()
 
 # ============================================
-# ANTI-BLOQUEO: WARMUP DE SESIÓN
-# ============================================
-async def warmup_session(session: aiohttp.ClientSession, proxy: Optional[str] = None):
-    """Realiza warmup de la sesión para establecer cookies y parecer un cliente real"""
-    if not WARMUP_ENABLED:
-        return True
-
-    try:
-        headers = get_random_headers()
-        async with session.get(
-            WARMUP_URL,
-            proxy=proxy,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=10),
-            allow_redirects=True
-        ) as resp:
-            # Guardar cookies para futuras solicitudes
-            for cookie in resp.cookies.values():
-                shared_cookies[cookie.key] = cookie.value
-            logger.debug(f"[WARMUP] ✅ Warmup completado (status: {resp.status})")
-            return resp.status == 200
-    except Exception as e:
-        logger.debug(f"[WARMUP] ⚠️ Warmup falló: {e}")
-        return False
-
-# ============================================
 # AUTO‑PING
 # ============================================
 async def self_ping():
@@ -430,175 +280,88 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# FUNCIONES CRASH (con ANTI-BLOQUEO completo)
+# FUNCIONES CRASH (con backoff tipo apis.py)
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
-def calculate_backoff(consecutive_errors: int, is_403: bool = False) -> float:
-    """Calcula backoff inteligente basado en el tipo de error"""
-    if is_403:
-        # Backoff más largo para 403
-        if consecutive_errors <= 2:
-            return random.uniform(10, 30)  # 10-30s para primeros errores
-        else:
-            return random.uniform(600, 1200)  # 10-20 min para errores persistentes
-    else:
-        # Backoff exponencial normal
-        return min(MAX_SLEEP, BASE_SLEEP * (2 ** consecutive_errors))
-
 async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
-    """
-    Versión mejorada de consultar_crash con ANTI-BLOQUEO completo:
-    - Proxies rotativos
-    - Headers realistas rotativos
-    - Warmup ocasional
-    - Bloqueo inteligente de proxies
-    - Manejo específico de 403 con pausas largas
-    """
-    global shared_cookies
     now = time.time()
-
-    # Verificar si hay bloqueo global
     if now < crash_status['next_allowed_time']:
         wait = crash_status['next_allowed_time'] - now
         if wait > 0.5:
-            logger.debug(f"[CRASH] ⏳ Backoff global {wait:.1f}s")
+            logger.debug(f"[CRASH] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    # Verificar bloqueo global por muchos errores consecutivos
-    if crash_status['consecutive_errors'] > 5:
-        block_duration = random.uniform(600, 1200)  # 10-20 minutos
-        crash_status['next_allowed_time'] = time.time() + block_duration
-        logger.error(f"[CRASH] 🔒 Bloqueo global tras {crash_status['consecutive_errors']} errores - esperando {block_duration:.0f}s")
-        await asyncio.sleep(block_duration)
-        return None
-
-    # Obtener proxy saludable
-    proxy = get_healthy_proxy() if PROXIES else None
-
-    # Obtener headers rotativos
-    headers = get_random_headers()
-
-    # Añadir cookies compartidas si existen
-    if shared_cookies:
-        cookie_str = "; ".join([f"{k}={v}" for k, v in shared_cookies.items()])
-        headers["Cookie"] = cookie_str
+    # ✅ FIX: Headers completos para evitar detección de bot y reducir 403
+    headers = {
+        'User-Agent': get_random_user_agent(),
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Origin': 'https://stake.com',
+        'Referer': 'https://stake.com/',
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    }
 
     try:
-        async with session.get(
-            API_CRASH,
-            headers=headers,
-            proxy=proxy,
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
+        async with session.get(API_CRASH, headers=headers, timeout=10) as resp:
+            if 'Retry-After' in resp.headers:
+                retry_after = int(resp.headers['Retry-After'])
+                crash_status['next_allowed_time'] = time.time() + retry_after
+                crash_status['consecutive_errors'] += 1
+                logger.warning(f"[CRASH] ⚠️ Retry-After {retry_after}s ({crash_status['consecutive_errors']} errores consecutivos)")
+                return None
 
-            # Guardar cookies de respuesta
-            for cookie in resp.cookies.values():
-                shared_cookies[cookie.key] = cookie.value
-
-            # ===== ÉXITO =====
             if resp.status == 200:
                 crash_status['consecutive_errors'] = 0
-                crash_status['request_count'] += 1
+                return await resp.json()
 
-                # Hacer warmup periódico si está habilitado
-                if WARMUP_ENABLED and crash_status['request_count'] % WARMUP_INTERVAL == 0:
-                    asyncio.create_task(warmup_session(session, proxy))
-
-                if proxy:
-                    mark_proxy_success(proxy)
-
-                data = await resp.json()
-                logger.debug(f"[CRASH] ✅ Datos recibidos (proxy: {proxy or 'none'})")
-                return data
-
-            # ===== 403 FORBIDDEN - MANEJO ESPECIAL =====
             elif resp.status == 403:
                 crash_status['consecutive_errors'] += 1
-
-                if proxy:
-                    mark_proxy_failed(proxy)
-
-                is_403 = True
-                backoff = calculate_backoff(crash_status['consecutive_errors'], is_403)
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
-
                 logger.warning(f"[CRASH] 🚫 403 Forbidden - Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
-
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    long_block = random.uniform(600, 1200)
-                    crash_status['next_allowed_time'] = time.time() + long_block
-                    logger.error(f"[CRASH] 🔒 Bloqueo prolongado {long_block:.0f}s tras {MAX_CONSECUTIVE_ERRORS} errores")
-
+                    crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
+                    logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s por {crash_status['consecutive_errors']} errores consecutivos")
                 return None
 
-            # ===== RATE LIMIT - USAR RETRY-AFTER =====
             elif resp.status == 429:
-                crash_status['consecutive_errors'] += 1
-
-                if 'Retry-After' in resp.headers:
-                    retry_after = int(resp.headers['Retry-After'])
-                else:
-                    retry_after = int(resp.headers.get('retry-after', 60))
-
+                retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + retry_after
-                logger.warning(f"[CRASH] ⚠️ Rate limit 429 - esperando {retry_after}s")
-
-                if proxy:
-                    mark_proxy_failed(proxy)
-
+                crash_status['consecutive_errors'] += 1
+                logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s ({crash_status['consecutive_errors']} errores consecutivos)")
                 return None
 
-            # ===== ERRORES 5XX =====
             elif 500 <= resp.status < 600:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
-
-                if proxy:
-                    mark_proxy_failed(proxy)
-
-                logger.error(f"[CRASH] ❌ Error {resp.status} - backoff {backoff:.1f}s")
+                logger.error(f"[CRASH] ❌ Error {resp.status}, Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
                 return None
 
-            # ===== CÓDIGO INESPERADO =====
             else:
                 logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
                 return None
 
-    # ===== TIMEOUT =====
     except asyncio.TimeoutError:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
         crash_status['next_allowed_time'] = time.time() + backoff
-
-        if proxy:
-            mark_proxy_failed(proxy)
-
-        logger.error(f"[CRASH] ⏰ Timeout - backoff {backoff:.1f}s")
+        logger.error(f"[CRASH] ⏰ Timeout, Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
         return None
-
-    # ===== ERROR DE CONEXIÓN =====
-    except aiohttp.ClientError as e:
-        crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-        crash_status['next_allowed_time'] = time.time() + backoff
-
-        if proxy:
-            mark_proxy_failed(proxy)
-
-        logger.error(f"[CRASH] 💥 Error de conexión: {e}")
-        return None
-
-    # ===== CUALQUIER OTRA EXCEPCIÓN =====
     except Exception as e:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
         crash_status['next_allowed_time'] = time.time() + backoff
-
-        logger.error(f"[CRASH] 💥 Excepción: {e}")
+        logger.error(f"[CRASH] 💥 Excepción: {e}, Backoff {backoff:.1f}s ({crash_status['consecutive_errors']} errores consecutivos)")
         return None
 
 async def procesar_crash(data: dict):
@@ -657,49 +420,18 @@ async def procesar_crash(data: dict):
         logger.warning(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
 async def monitor_crash():
-    """
-    Monitor principal con intervalos HUMANOS (2-5s) para reducir detección
-    """
-    logger.info("[CRASH] 🚀 Iniciando monitor con ANTI-BLOQUEO (intervalo ~2-5s con jitter)")
-
-    # Realizar warmup inicial si está habilitado
-    if WARMUP_ENABLED:
-        logger.info("[CRASH] 🔄 Realizando warmup inicial...")
-        async with aiohttp.ClientSession() as session_for_warmup:
-            await warmup_session(session_for_warmup)
-
+    logger.info("[CRASH] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-                # INTERVALO HUMANO: 2-5 segundos con jitter adicional
-                # Esto simula comportamiento humano y reduce detección
-                sleep_time = random.uniform(2, 5) + random.random()
-                logger.debug(f"[CRASH] 💤 Intervalo humano: {sleep_time:.2f}s")
+                # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
+                sleep_time = random.uniform(1.5, 2.5)
                 await asyncio.sleep(sleep_time)
             else:
-                # Si falló, el backoff ya esperó, añadimos un poco más
-                sleep_time = random.uniform(1, 3)
-                await asyncio.sleep(sleep_time)
-
-# ============================================
-# ESTADÍSTICAS ANTI-BLOQUEO
-# ============================================
-async def stats_handler(request):
-    """Endpoint para ver estadísticas de anti-bloqueo"""
-    stats = {
-        'crash_status': {
-            'consecutive_errors': crash_status['consecutive_errors'],
-            'next_allowed_time': crash_status['next_allowed_time'],
-            'request_count': crash_status['request_count']
-        },
-        'proxy_stats': get_proxy_stats() if PROXIES else {},
-        'proxies_configured': len(PROXIES) > 0,
-        'warmup_enabled': WARMUP_ENABLED,
-        'warmup_interval': WARMUP_INTERVAL
-    }
-    return web.json_response(stats)
+                # Si falló, el backoff ya esperó; añadimos 1s extra para no saturar
+                await asyncio.sleep(1)
 
 # ============================================
 # SERVIDOR HTTP + WEBSOCKET
@@ -725,20 +457,19 @@ async def websocket_handler(request):
             if msg.type == web.WSMsgType.CLOSE:
                 break
     finally:
-        connected_clients.remove(ws)
+        connected_clients.discard(ws)  # ✅ FIX: discard evita KeyError si ya fue removido
     return ws
 
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(text="Servidor Crash activo con ANTI-BLOQUEO. Use /ws para WebSocket, /stats para estadísticas o /health para health check.", status=200)
+    return web.Response(text="Servidor Crash activo. Use /ws para WebSocket o /health para health check.", status=200)
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/health', health_handler)
-    app.router.add_get('/stats', stats_handler)
     app.router.add_get('/', root_handler)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -753,16 +484,7 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor Crash ANTI-BLOQUEO")
-    logger.info("   - Proxies rotativos")
-    logger.info("   - Headers realistas")
-    logger.info("   - Warmup de cookies")
-    logger.info("   - Backoff inteligente")
-    logger.info("   - Intervalos humanos (2-5s)")
-    if PROXIES:
-        logger.info(f"   - {len(PROXIES)} proxies configurados")
-    else:
-        logger.info("   - ⚠️ Sin proxies (usando conexión directa)")
+    logger.info("🚀 Monitor Crash con almacenamiento 100k eventos, envío últimos 100")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
