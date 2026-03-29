@@ -252,11 +252,25 @@ def _registrar_error(descripcion: str):
         crash_status['next_allowed_time'] = time.time() + backoff
         logger.warning(f"[CRASH] {descripcion} - Backoff {backoff:.1f}s ({n} errores consecutivos)")
 
+def _get_proxies() -> dict | None:
+    """
+    Lee la URL del proxy desde la variable de entorno PROXY_URL.
+    Formato: http://usuario:password@host:puerto
+    Ejemplo Webshare: http://user-abc:pass123@proxy.webshare.io:80
+    Retorna None si no está configurado (sin proxy).
+    """
+    proxy_url = os.environ.get('PROXY_URL')
+    if proxy_url:
+        return {'http': proxy_url, 'https': proxy_url}
+    return None
+
 def _hacer_request_sync() -> tuple[int, dict | None]:
     """
     Ejecuta la petición HTTP de forma síncrona con cloudscraper.
+    Usa proxy residencial si PROXY_URL está configurado.
     Retorna (status_code, json_data_o_None).
     """
+    proxies = _get_proxies()
     try:
         resp = _scraper.get(
             API_CRASH,
@@ -269,12 +283,14 @@ def _hacer_request_sync() -> tuple[int, dict | None]:
                 'Sec-Fetch-Mode': 'cors',
                 'Sec-Fetch-Site': 'cross-site',
             },
+            proxies=proxies,
             timeout=15
         )
         if resp.status_code == 200:
             return 200, resp.json()
         return resp.status_code, None
     except Exception as e:
+        logger.debug(f"[CRASH] Error en request: {e}")
         return -1, None
 
 async def _hacer_request_aiohttp(session: aiohttp.ClientSession) -> tuple[int, dict | None]:
@@ -444,6 +460,12 @@ async def main():
     logger.info("=" * 60)
     logger.info("🚀 Monitor Crash - 100k eventos, envío últimos 100")
     logger.info(f"   CF Bypass: {'cloudscraper ✅' if USE_CLOUDSCRAPER else 'aiohttp ⚠️  → pip install cloudscraper'}")
+    proxy_url = os.environ.get('PROXY_URL')
+    if proxy_url:
+        safe = proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url
+        logger.info(f"   Proxy: ✅ {safe}")
+    else:
+        logger.warning("   Proxy: ⚠️  No configurado (PROXY_URL vacío) — IP datacenter puede ser bloqueada")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
