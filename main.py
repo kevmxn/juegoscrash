@@ -275,13 +275,18 @@ def _hacer_request_sync() -> tuple[int, dict | None]:
         resp = _scraper.get(
             API_CRASH,
             headers={
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Origin': 'https://stake.com',
-                'Referer': 'https://stake.com/',
+                'Accept': '*/*',
+                'Accept-Language': 'es-ES,es;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br, zstd',
+                'Origin': 'https://www.casino.org',       # ✅ origen correcto
+                'Referer': 'https://www.casino.org/',     # ✅ referer correcto
                 'Sec-Fetch-Dest': 'empty',
                 'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'cross-site',
+                'Sec-Fetch-Site': 'same-site',            # ✅ same-site, no cross-site
+                'Sec-Ch-Ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Windows"',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
             },
             proxies=proxies,
             timeout=15
@@ -299,10 +304,18 @@ async def _hacer_request_aiohttp(session: aiohttp.ClientSession) -> tuple[int, d
         async with session.get(
             API_CRASH,
             headers={
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Origin': 'https://stake.com',
-                'Referer': 'https://stake.com/',
+                'Accept': '*/*',
+                'Accept-Language': 'es-ES,es;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br, zstd',
+                'Origin': 'https://www.casino.org',
+                'Referer': 'https://www.casino.org/',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-site',
+                'Sec-Ch-Ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Windows"',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
             },
             timeout=aiohttp.ClientTimeout(total=15)
         ) as resp:
