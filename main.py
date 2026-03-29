@@ -9,7 +9,7 @@ Monitor exclusivo para CRASH con servidor HTTP y WebSocket
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
 - Persistencia con SQLite
-- Backoff exponencial y circuit breaker
+- Backoff exponencial y circuit breaker (estilo apis.py)
 - Auto‑ping cada 10 minutos
 """
 
@@ -39,27 +39,54 @@ logger = logging.getLogger(__name__)
 API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 DB_PATH = "crash_data.db"
 
+# User Agents (predominantemente Windows, tomados de apis.py)
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 Edg/118.0.2088.76',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/118.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0',
-    'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/119.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (Windows NT 6.1; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko/20100101 Firefox/11.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
+    "Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:56.0) Gecko/20100101 Firefox/56.0",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0 Waterfox/109.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Goanna/5.0 Firefox/78.0 PaleMoon/29.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E)",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0; .NET CLR 2.0.50727; .NET CLR 3.0.4506.2152; .NET CLR 3.5.30729)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (X11; Linux i686; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
 ]
 
 BASE_SLEEP = 1.0
@@ -68,7 +95,7 @@ MAX_CONSECUTIVE_ERRORS = 10
 BLOCK_TIME = 300
 
 crash_ids: Set[str] = set()
-crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0, 'blocked_until': 0}
+crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
 crash_history: list = []
 MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
 MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
@@ -253,92 +280,73 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# FUNCIONES CRASH
+# FUNCIONES CRASH (con backoff tipo apis.py)
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
 async def consultar_crash(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
-    if now < crash_status['blocked_until']:
-        wait = crash_status['blocked_until'] - now
-        logger.info(f"[CRASH] 🚫 Bloqueado por {wait:.1f}s")
-        await asyncio.sleep(wait)
-        return None
     if now < crash_status['next_allowed_time']:
         wait = crash_status['next_allowed_time'] - now
-        logger.info(f"[CRASH] ⏳ Backoff {wait:.1f}s")
+        if wait > 0.5:
+            logger.debug(f"[CRASH] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    headers = {
-        'User-Agent': get_random_user_agent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-    }
-
+    headers = {'User-Agent': get_random_user_agent()}
     try:
         async with session.get(API_CRASH, headers=headers, timeout=10) as resp:
             if 'Retry-After' in resp.headers:
                 retry_after = int(resp.headers['Retry-After'])
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
-                logger.warning(f"[CRASH] ⚠️ Esperar {retry_after}s (Retry-After)")
+                logger.warning(f"[CRASH] ⚠️ Retry-After {retry_after}s")
                 return None
+
             if resp.status == 200:
                 crash_status['consecutive_errors'] = 0
                 return await resp.json()
+
             elif resp.status == 403:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
                 logger.warning(f"[CRASH] 🚫 403 Forbidden - backoff {backoff:.1f}s")
                 if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
+                    crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
                     logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s")
                 return None
+
             elif resp.status == 429:
                 retry_after = int(resp.headers.get('Retry-After', 2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + retry_after
                 crash_status['consecutive_errors'] += 1
                 logger.warning(f"[CRASH] ⚠️ Rate limit, esperar {retry_after}s")
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
+
             elif 500 <= resp.status < 600:
                 crash_status['consecutive_errors'] += 1
                 backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
                 crash_status['next_allowed_time'] = time.time() + backoff
                 logger.error(f"[CRASH] ❌ Error {resp.status}, backoff {backoff:.1f}s")
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
+
             else:
                 logger.warning(f"[CRASH] ⚠️ Código inesperado: {resp.status}")
-                crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
-                crash_status['next_allowed_time'] = time.time() + backoff
-                if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    crash_status['blocked_until'] = time.time() + BLOCK_TIME
                 return None
+
     except asyncio.TimeoutError:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
         crash_status['next_allowed_time'] = time.time() + backoff
         logger.error(f"[CRASH] ⏰ Timeout, backoff {backoff:.1f}s")
-        if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-            crash_status['blocked_until'] = time.time() + BLOCK_TIME
         return None
     except Exception as e:
         crash_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** crash_status['consecutive_errors']))
         crash_status['next_allowed_time'] = time.time() + backoff
         logger.error(f"[CRASH] 💥 Excepción: {e}")
-        if crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-            crash_status['blocked_until'] = time.time() + BLOCK_TIME
         return None
 
 async def procesar_crash(data: dict):
@@ -397,13 +405,18 @@ async def procesar_crash(data: dict):
         logger.warning(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
 async def monitor_crash():
-    logger.info("[CRASH] 🚀 Iniciando monitor")
+    logger.info("[CRASH] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
     async with aiohttp.ClientSession() as session:
         while True:
             data = await consultar_crash(session)
             if data:
                 await procesar_crash(data)
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+                # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
+                sleep_time = random.uniform(1.5, 2.5)
+                await asyncio.sleep(sleep_time)
+            else:
+                # Si falló, el backoff ya esperó, añadimos 1s extra para no saturar
+                await asyncio.sleep(1)
 
 # ============================================
 # SERVIDOR HTTP + WEBSOCKET
