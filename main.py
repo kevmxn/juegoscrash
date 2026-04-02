@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor exclusivo para CRASH con servidor HTTP y WebSocket
-- Polling a la API de Stake Crash con cloudscraper (bypass Cloudflare)
+Monitor exclusivo para Crash con servidor HTTP y WebSocket
+- Polling a la API de Stake Crash
 - Almacena hasta 100,000 eventos en SQLite
 - Envía solo los últimos 100 eventos al conectar
 - Eventos en lotes de hasta 20 cada 1 segundo
 - Tabla de niveles enviada cada 60-120 segundos (aleatorio)
-- Backoff exponencial y circuit breaker
+- Persistencia con SQLite
+- Backoff exponencial y circuit breaker (estilo apis.py)
 - Auto‑ping cada 10 minutos
 """
 
@@ -21,24 +22,9 @@ import random
 import logging
 import os
 from datetime import datetime
-from typing import Set, List
+from typing import Set, Dict, Any, List
 from collections import defaultdict
 import aiosqlite
-
-# ✅ cloudscraper maneja cookies y JS challenges de Cloudflare
-# pip install cloudscraper
-try:
-    import cloudscraper
-    _scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'mobile': False
-        }
-    )
-    USE_CLOUDSCRAPER = True
-except ImportError:
-    USE_CLOUDSCRAPER = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,31 +33,79 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-if not USE_CLOUDSCRAPER:
-    logger.warning("⚠️  cloudscraper no instalado. Instalar: pip install cloudscraper")
-
 # ============================================
-# CONFIGURACIÓN CRASH
+# CONFIGURACIÓN Crash
 # ============================================
-API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
+API_Crash = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 DB_PATH = "crash_data.db"
+
+# User Agents (misma lista extensa que en crashstake.py y apis.py)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (Windows NT 6.1; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko/20100101 Firefox/11.0",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
+    "Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:56.0) Gecko/20100101 Firefox/56.0",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0 Waterfox/109.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Goanna/5.0 Firefox/78.0 PaleMoon/29.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E)",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0; .NET CLR 2.0.50727; .NET CLR 3.0.4506.2152; .NET CLR 3.5.30729)",
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0",
+    "Mozilla/5.0 (X11; Linux i686; rv:52.0) Gecko/20100101 Firefox/52.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
+    "Mozilla/5.0 (X11; Linux i686; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
+    "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
+]
 
 BASE_SLEEP = 1.0
 MAX_SLEEP = 60.0
 MAX_CONSECUTIVE_ERRORS = 10
 BLOCK_TIME = 300
 
-crash_ids: Set[str] = set()
-crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
-crash_history: list = []
-MAX_HISTORY = 100
-MAX_STORAGE = 100000
+Crash_ids: Set[str] = set()
+Crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
+Crash_history: list = []
+MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
+MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
 
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
 connected_clients: Set[web.WebSocketResponse] = set()
 
+# Batching
 event_queue = asyncio.Queue()
 BATCH_SIZE = 20
 BATCH_TIMEOUT = 1.0
@@ -80,7 +114,7 @@ TABLE_UPDATE_MIN = 60
 TABLE_UPDATE_MAX = 120
 
 # ============================================
-# BASE DE DATOS
+# FUNCIONES DE BASE DE DATOS
 # ============================================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -88,7 +122,6 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS events (
                 id TEXT PRIMARY KEY,
                 maxMultiplier REAL,
-                roundDuration REAL,
                 startedAt TEXT,
                 timestamp_recepcion TEXT,
                 nivel INTEGER
@@ -111,22 +144,24 @@ async def init_db():
         await db.commit()
 
 async def load_from_db():
-    global crash_history, crash_ids, level_counts, current_level
+    global Crash_history, Crash_ids, level_counts, current_level
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            'SELECT id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel '
-            'FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)
-        ) as cursor:
+        # Cargar últimos 100 eventos en memoria
+        async with db.execute('SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
             rows = await cursor.fetchall()
-            crash_history = []
-            crash_ids.clear()
+            Crash_history = []
+            Crash_ids.clear()
             for row in rows:
-                crash_history.append({
-                    'event_id': row[0], 'maxMultiplier': row[1],
-                    'roundDuration': row[2], 'startedAt': row[3],
-                    'timestamp_recepcion': row[4], 'nivel': row[5]
-                })
-                crash_ids.add(row[0])
+                event = {
+                    'event_id': row[0],
+                    'maxMultiplier': row[1],
+                    'startedAt': row[2],
+                    'timestamp_recepcion': row[3],
+                    'nivel': row[4]
+                }
+                Crash_history.append(event)
+                Crash_ids.add(row[0])
+        # Cargar contadores y estado
         async with db.execute('SELECT level, range, count FROM counts') as cursor:
             rows = await cursor.fetchall()
             level_counts.clear()
@@ -138,19 +173,16 @@ async def load_from_db():
                 current_level = int(row[0])
             else:
                 current_level = 0
-                await db.execute('INSERT OR IGNORE INTO state VALUES (?, ?)', ('current_level', '0'))
+                await db.execute('INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)', ('current_level', '0'))
                 await db.commit()
 
 async def save_event(event: dict):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
-            INSERT OR REPLACE INTO events (id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion, nivel)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            event['event_id'], event['maxMultiplier'],
-            event.get('roundDuration'), event.get('startedAt'),
-            event['timestamp_recepcion'], event['nivel']
-        ))
+            INSERT OR REPLACE INTO events (id, maxMultiplier, startedAt, timestamp_recepcion, nivel)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (event['event_id'], event['maxMultiplier'], event.get('startedAt'), event['timestamp_recepcion'], event['nivel']))
+        # Mantener solo los últimos MAX_STORAGE eventos en BD
         await db.execute('''
             DELETE FROM events WHERE id NOT IN (
                 SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
@@ -168,7 +200,9 @@ async def update_count(level: int, range_key: str):
 
 async def update_current_level(level: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR REPLACE INTO state VALUES (?, ?)', ('current_level', str(level)))
+        await db.execute('''
+            INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)
+        ''', ('current_level', str(level)))
         await db.commit()
 
 # ============================================
@@ -181,13 +215,13 @@ async def self_ping():
         await asyncio.sleep(600)
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with session.get(url, timeout=5) as resp:
                     if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso")
+                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
                     else:
-                        logger.warning(f"[PING] Falló con código {resp.status}")
+                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
         except Exception as e:
-            logger.error(f"[PING] Error: {e}")
+            logger.error(f"[PING] Error en auto‑ping: {e}")
 
 # ============================================
 # BATCH SENDER
@@ -211,7 +245,11 @@ async def batch_sender():
 async def send_batch(events_list: List[dict]):
     if not connected_clients:
         return
-    message = json.dumps({'tipo': 'batch', 'eventos': events_list}, default=str)
+    batch_msg = {
+        'tipo': 'batch',
+        'eventos': events_list
+    }
+    message = json.dumps(batch_msg, default=str)
     await asyncio.gather(
         *[client.send_str(message) for client in connected_clients],
         return_exceptions=True
@@ -227,11 +265,12 @@ async def periodic_table_sender():
         await asyncio.sleep(interval)
         if not connected_clients:
             continue
-        message = json.dumps({
+        table_msg = {
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
             'conteos': {k: dict(v) for k, v in level_counts.items()}
-        }, default=str)
+        }
+        message = json.dumps(table_msg, default=str)
         await asyncio.gather(
             *[client.send_str(message) for client in connected_clients],
             return_exceptions=True
@@ -239,186 +278,140 @@ async def periodic_table_sender():
         logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
 
 # ============================================
-# CONSULTA CRASH
+# FUNCIONES Crash (con backoff estilo apis.py)
 # ============================================
-def _registrar_error(descripcion: str):
-    crash_status['consecutive_errors'] += 1
-    n = crash_status['consecutive_errors']
-    backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** n))
-    if n >= MAX_CONSECUTIVE_ERRORS:
-        crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
-        logger.error(f"[CRASH] 🔒 Bloqueado {BLOCK_TIME}s ({n} errores) - {descripcion}")
-    else:
-        crash_status['next_allowed_time'] = time.time() + backoff
-        logger.warning(f"[CRASH] {descripcion} - Backoff {backoff:.1f}s ({n} errores consecutivos)")
+def get_random_user_agent() -> str:
+    return random.choice(USER_AGENTS)
 
-def _get_proxies() -> dict | None:
-    """
-    Lee la URL del proxy desde la variable de entorno PROXY_URL.
-    Formato: http://usuario:password@host:puerto
-    Ejemplo Webshare: http://user-abc:pass123@proxy.webshare.io:80
-    Retorna None si no está configurado (sin proxy).
-    """
-    proxy_url = os.environ.get('PROXY_URL')
-    if proxy_url:
-        return {'http': proxy_url, 'https': proxy_url}
-    return None
-
-def _hacer_request_sync() -> tuple[int, dict | None]:
-    """
-    Ejecuta la petición HTTP de forma síncrona con cloudscraper.
-    Usa proxy residencial si PROXY_URL está configurado.
-    Retorna (status_code, json_data_o_None).
-    """
-    proxies = _get_proxies()
-    try:
-        resp = _scraper.get(
-            API_CRASH,
-            headers={
-                'Accept': '*/*',
-                'Accept-Language': 'es-ES,es;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br, zstd',
-                'Origin': 'https://www.casino.org',       # ✅ origen correcto
-                'Referer': 'https://www.casino.org/',     # ✅ referer correcto
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-site',            # ✅ same-site, no cross-site
-                'Sec-Ch-Ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-                'Sec-Ch-Ua-Mobile': '?0',
-                'Sec-Ch-Ua-Platform': '"Windows"',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-            },
-            proxies=proxies,
-            timeout=15
-        )
-        if resp.status_code == 200:
-            return 200, resp.json()
-        return resp.status_code, None
-    except Exception as e:
-        logger.debug(f"[CRASH] Error en request: {e}")
-        return -1, None
-
-async def _hacer_request_aiohttp(session: aiohttp.ClientSession) -> tuple[int, dict | None]:
-    """Fallback con aiohttp si cloudscraper no está disponible."""
-    try:
-        async with session.get(
-            API_CRASH,
-            headers={
-                'Accept': '*/*',
-                'Accept-Language': 'es-ES,es;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br, zstd',
-                'Origin': 'https://www.casino.org',
-                'Referer': 'https://www.casino.org/',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-site',
-                'Sec-Ch-Ua': '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-                'Sec-Ch-Ua-Mobile': '?0',
-                'Sec-Ch-Ua-Platform': '"Windows"',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-            },
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            if resp.status == 200:
-                return 200, await resp.json()
-            return resp.status, None
-    except Exception:
-        return -1, None
-
-async def consultar_crash(aiohttp_session: aiohttp.ClientSession) -> dict | None:
+async def consultar_Crash(session: aiohttp.ClientSession) -> dict | None:
     now = time.time()
-    if now < crash_status['next_allowed_time']:
-        wait = crash_status['next_allowed_time'] - now
+    if now < Crash_status['next_allowed_time']:
+        wait = Crash_status['next_allowed_time'] - now
         if wait > 0.5:
-            logger.debug(f"[CRASH] ⏳ En backoff, esperando {wait:.1f}s")
+            logger.debug(f"[Crash] ⏳ Backoff {wait:.1f}s")
         await asyncio.sleep(wait)
         return None
 
-    # cloudscraper es síncrono → ejecutar en thread pool para no bloquear el event loop
-    if USE_CLOUDSCRAPER:
-        loop = asyncio.get_event_loop()
-        status, data = await loop.run_in_executor(None, _hacer_request_sync)
-    else:
-        status, data = await _hacer_request_aiohttp(aiohttp_session)
+    headers = {'User-Agent': get_random_user_agent()}
+    try:
+        async with session.get(API_Crash, headers=headers, timeout=10) as resp:
+            if 'Retry-After' in resp.headers:
+                retry_after = int(resp.headers['Retry-After'])
+                Crash_status['next_allowed_time'] = time.time() + retry_after
+                Crash_status['consecutive_errors'] += 1
+                logger.warning(f"[Crash] ⚠️ Retry-After {retry_after}s")
+                return None
 
-    if status == 200:
-        crash_status['consecutive_errors'] = 0
-        return data
-    elif status == 403:
-        _registrar_error("🚫 403 Forbidden")
-    elif status == 429:
-        _registrar_error("⚠️ 429 Rate Limit")
-    elif 500 <= status < 600:
-        _registrar_error(f"❌ Error {status}")
-    elif status == -1:
-        _registrar_error("💥 Excepción / Timeout")
-    else:
-        logger.warning(f"[CRASH] ⚠️ Código inesperado: {status}")
-    return None
+            if resp.status == 200:
+                Crash_status['consecutive_errors'] = 0
+                return await resp.json()
 
-# ============================================
-# PROCESAMIENTO
-# ============================================
-async def procesar_crash(data: dict):
-    global current_level, crash_history, level_counts
+            elif resp.status == 403:
+                Crash_status['consecutive_errors'] += 1
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+                Crash_status['next_allowed_time'] = time.time() + backoff
+                logger.warning(f"[Crash] 🚫 403 Forbidden - backoff {backoff:.1f}s")
+                if Crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
+                    Crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
+                    logger.error(f"[Crash] 🔒 Bloqueado {BLOCK_TIME}s")
+                return None
+
+            elif resp.status == 429:
+                retry_after = int(resp.headers.get('Retry-After', 2 ** Crash_status['consecutive_errors']))
+                Crash_status['next_allowed_time'] = time.time() + retry_after
+                Crash_status['consecutive_errors'] += 1
+                logger.warning(f"[Crash] ⚠️ Rate limit, esperar {retry_after}s")
+                return None
+
+            elif 500 <= resp.status < 600:
+                Crash_status['consecutive_errors'] += 1
+                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+                Crash_status['next_allowed_time'] = time.time() + backoff
+                logger.error(f"[Crash] ❌ Error {resp.status}, backoff {backoff:.1f}s")
+                return None
+
+            else:
+                logger.warning(f"[Crash] ⚠️ Código inesperado: {resp.status}")
+                return None
+
+    except asyncio.TimeoutError:
+        Crash_status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+        Crash_status['next_allowed_time'] = time.time() + backoff
+        logger.error(f"[Crash] ⏰ Timeout, backoff {backoff:.1f}s")
+        return None
+    except Exception as e:
+        Crash_status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
+        Crash_status['next_allowed_time'] = time.time() + backoff
+        logger.error(f"[Crash] 💥 Excepción: {e}")
+        return None
+
+async def procesar_Crash(data: dict):
+    global current_level, Crash_history, level_counts
     event_id = data.get('id')
-    if not event_id or event_id in crash_ids:
+    if not event_id or event_id in Crash_ids:
         return
-    crash_ids.add(event_id)
+    Crash_ids.add(event_id)
     data_inner = data.get('data', {})
     result = data_inner.get('result', {})
     max_mult = result.get('maxMultiplier')
-    round_dur = result.get('roundDuration')
     started_at = data_inner.get('startedAt')
+    if max_mult is not None and max_mult > 0:
+        # Actualizar nivel
+        if max_mult < 2.00:
+            current_level -= 1
+        else:
+            current_level += 1
 
-    if max_mult is None or max_mult <= 0:
-        logger.warning(f"[CRASH] ⚠️ ID {event_id} mult inválido: {max_mult}")
-        return
+        # Determinar rango
+        range_key = None
+        if 3.00 <= max_mult <= 4.99:
+            range_key = '3-4.99'
+        elif 5.00 <= max_mult <= 9.99:
+            range_key = '5-9.99'
+        elif max_mult >= 10.00:
+            range_key = '10+'
 
-    current_level += 1 if max_mult >= 2.00 else -1
+        evento = {
+            'tipo': 'Crash',
+            'event_id': event_id,
+            'maxMultiplier': max_mult,
+            'startedAt': started_at,
+            'timestamp_recepcion': datetime.now().isoformat(),
+            'nivel': current_level
+        }
 
-    range_key = None
-    if 3.00 <= max_mult <= 4.99:
-        range_key = '3-4.99'
-    elif 5.00 <= max_mult <= 9.99:
-        range_key = '5-9.99'
-    elif max_mult >= 10.00:
-        range_key = '10+'
+        # Actualizar memoria (últimos 100 eventos)
+        Crash_history.insert(0, evento)
+        if len(Crash_history) > MAX_HISTORY:
+            Crash_history.pop()
+        if range_key:
+            level_counts[current_level][range_key] += 1
 
-    evento = {
-        'tipo': 'crash',
-        'event_id': event_id,
-        'maxMultiplier': max_mult,
-        'roundDuration': round_dur,
-        'startedAt': started_at,
-        'timestamp_recepcion': datetime.now().isoformat(),
-        'nivel': current_level
-    }
+        # Guardar en BD (almacena hasta MAX_STORAGE)
+        await save_event(evento)
+        if range_key:
+            await update_count(current_level, range_key)
+        await update_current_level(current_level)
 
-    crash_history.insert(0, evento)
-    if len(crash_history) > MAX_HISTORY:
-        crash_history.pop()
-    if range_key:
-        level_counts[current_level][range_key] += 1
+        logger.info(f"[Crash] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
+        await event_queue.put(evento)
+    else:
+        logger.warning(f"[Crash] ⚠️ ID {event_id} mult inválido: {max_mult}")
 
-    await save_event(evento)
-    if range_key:
-        await update_count(current_level, range_key)
-    await update_current_level(current_level)
-
-    logger.info(f"[CRASH] ✅ NUEVO: ID={event_id} | {max_mult}x | Duración={round_dur}s | Nivel={current_level}")
-    await event_queue.put(evento)
-
-async def monitor_crash():
-    modo = 'cloudscraper ✅' if USE_CLOUDSCRAPER else 'aiohttp ⚠️ (instalar cloudscraper)'
-    logger.info(f"[CRASH] 🚀 Iniciando monitor | Modo: {modo}")
+async def monitor_Crash():
+    logger.info("[Crash] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
     async with aiohttp.ClientSession() as session:
         while True:
-            data = await consultar_crash(session)
+            data = await consultar_Crash(session)
             if data:
-                await procesar_crash(data)
-                await asyncio.sleep(random.uniform(1.5, 2.5))
+                await procesar_Crash(data)
+                # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
+                sleep_time = random.uniform(1.5, 2.5)
+                await asyncio.sleep(sleep_time)
             else:
+                # Si falló, el backoff ya esperó, añadimos 1s extra para no saturar
                 await asyncio.sleep(1)
 
 # ============================================
@@ -429,8 +422,12 @@ async def websocket_handler(request):
     await ws.prepare(request)
     connected_clients.add(ws)
     try:
-        if crash_history:
-            await ws.send_json({'tipo': 'historial', 'api': 'crash', 'eventos': crash_history})
+        if Crash_history:
+            await ws.send_json({
+                'tipo': 'historial',
+                'api': 'Crash',
+                'eventos': Crash_history
+            })
         await ws.send_json({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
@@ -441,17 +438,14 @@ async def websocket_handler(request):
             if msg.type == web.WSMsgType.CLOSE:
                 break
     finally:
-        connected_clients.discard(ws)
+        connected_clients.remove(ws)
     return ws
 
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def root_handler(request):
-    return web.Response(
-        text="Servidor Crash activo. Use /ws para WebSocket o /health para health check.",
-        status=200
-    )
+    return web.Response(text="Servidor crash activo. Use /ws para WebSocket o /health para health check.", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -463,7 +457,7 @@ async def start_web_server():
     port = int(os.environ.get('PORT', 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"✅ Servidor Crash escuchando en puerto {port}")
+    logger.info(f"✅ Servidor crash escuchando en puerto {port}")
     await asyncio.Future()
 
 # ============================================
@@ -471,14 +465,7 @@ async def start_web_server():
 # ============================================
 async def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor Crash - 100k eventos, envío últimos 100")
-    logger.info(f"   CF Bypass: {'cloudscraper ✅' if USE_CLOUDSCRAPER else 'aiohttp ⚠️  → pip install cloudscraper'}")
-    proxy_url = os.environ.get('PROXY_URL')
-    if proxy_url:
-        safe = proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url
-        logger.info(f"   Proxy: ✅ {safe}")
-    else:
-        logger.warning("   Proxy: ⚠️  No configurado (PROXY_URL vacío) — IP datacenter puede ser bloqueada")
+    logger.info("🚀 Monitor crash con almacenamiento 100k eventos, envío últimos 100")
     logger.info("=" * 60)
     await init_db()
     await load_from_db()
@@ -486,7 +473,7 @@ async def main():
     asyncio.create_task(periodic_table_sender())
     tasks = [
         asyncio.create_task(start_web_server()),
-        asyncio.create_task(monitor_crash()),
+        asyncio.create_task(monitor_Crash()),
         asyncio.create_task(self_ping()),
     ]
     try:
