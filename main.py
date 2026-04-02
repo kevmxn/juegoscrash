@@ -10,9 +10,24 @@ import websockets
 import json
 import os
 import random
+import logging
+import sys
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ============================================
+# CONFIGURACIÓN DE LOGGING PARA RENDER
+# ============================================
+# Configurar logging para que sea visible en la consola de Render
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ============================================
 # CONFIGURACIÓN
@@ -71,6 +86,7 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON eventos (timestamp_recepcion)')
     conn.commit()
     conn.close()
+    logger.info("✅ Base de datos inicializada correctamente")
 
 init_db()
 
@@ -108,6 +124,37 @@ def obtener_ultimos_eventos(api, limite=MAX_HISTORY):
         })
     return eventos
 
+def obtener_estadisticas_giros():
+    """Obtiene estadísticas de los últimos giros para logging"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    # Total de giros
+    c.execute("SELECT COUNT(*) FROM eventos WHERE api = 'crash'")
+    total_giros = c.fetchone()[0]
+
+    # Promedio de multiplicadores
+    c.execute("SELECT AVG(maxMultiplier) FROM eventos WHERE api = 'crash'")
+    avg_multiplier = c.fetchone()[0] or 0
+
+    # Último giro
+    c.execute("SELECT maxMultiplier, startedAt FROM eventos WHERE api = 'crash' ORDER BY timestamp_recepcion DESC LIMIT 1")
+    ultimo = c.fetchone()
+
+    # Giros en la última hora
+    c.execute("SELECT COUNT(*) FROM eventos WHERE api = 'crash' AND timestamp_recepcion > datetime('now', '-1 hour')")
+    giros_ultima_hora = c.fetchone()[0]
+
+    conn.close()
+
+    return {
+        'total_giros': total_giros,
+        'avg_multiplier': round(avg_multiplier, 2),
+        'ultimo_multiplicador': round(ultimo[0], 2) if ultimo else None,
+        'ultimo_startedAt': ultimo[1] if ultimo else None,
+        'giros_ultima_hora': giros_ultima_hora
+    }
+
 # ============================================
 # CONFIGURACIÓN DE SESIÓN HTTP
 # ============================================
@@ -131,7 +178,9 @@ sesion_global = crear_sesion()
 # ============================================
 api_status = {
     'consecutive_errors': 0,
-    'next_allowed_time': 0
+    'next_allowed_time': 0,
+    'total_requests': 0,
+    'total_giros_detectados': 0
 }
 
 def get_random_user_agent():
@@ -139,10 +188,11 @@ def get_random_user_agent():
 
 def consultar_con_backoff(url):
     now = time.time()
+    api_status['total_requests'] += 1
 
     if now < api_status['next_allowed_time']:
         wait = api_status['next_allowed_time'] - now
-        print(f"⏳ API en espera por {wait:.1f}s (backoff)")
+        logger.info(f"⏳ API en espera por {wait:.1f}s (backoff)")
         time.sleep(wait)
         return None
 
@@ -154,7 +204,7 @@ def consultar_con_backoff(url):
             retry_after = int(resp.headers['Retry-After'])
             api_status['next_allowed_time'] = time.time() + retry_after
             api_status['consecutive_errors'] += 1
-            print(f"⚠️ API pide esperar {retry_after}s")
+            logger.warning(f"⚠️ API pide esperar {retry_after}s (Retry-After header)")
             return None
 
         if resp.status_code == 200:
@@ -164,29 +214,29 @@ def consultar_con_backoff(url):
             retry_after = int(resp.headers.get('Retry-After', 2 ** api_status['consecutive_errors']))
             api_status['next_allowed_time'] = time.time() + retry_after
             api_status['consecutive_errors'] += 1
-            print(f"⚠️ Rate limited. Esperando {retry_after}s")
+            logger.warning(f"⚠️ Rate limited (429). Esperando {retry_after}s")
             return None
         elif 500 <= resp.status_code < 600:
             api_status['consecutive_errors'] += 1
             backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
             api_status['next_allowed_time'] = time.time() + backoff
-            print(f"❌ Error {resp.status_code}. Backoff {backoff:.1f}s")
+            logger.error(f"❌ Error servidor {resp.status_code}. Backoff {backoff:.1f}s")
             return None
         else:
-            print(f"⚠️ Código no esperado: {resp.status_code}")
+            logger.warning(f"⚠️ Código no esperado: {resp.status_code}")
             return None
 
     except requests.exceptions.Timeout:
         api_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
         api_status['next_allowed_time'] = time.time() + backoff
-        print(f"⏰ Timeout. Backoff {backoff:.1f}s")
+        logger.error(f"⏰ Timeout. Backoff {backoff:.1f}s")
         return None
     except Exception as e:
         api_status['consecutive_errors'] += 1
         backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
         api_status['next_allowed_time'] = time.time() + backoff
-        print(f"💥 Error: {e}. Backoff {backoff:.1f}s")
+        logger.error(f"💥 Error: {e}. Backoff {backoff:.1f}s")
         return None
 
 # ============================================
@@ -197,7 +247,10 @@ websocket_loop = None
 stop_websocket = threading.Event()
 
 async def websocket_handler(websocket):
+    client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
     connected_clients.add(websocket)
+    logger.info(f"🔌 Cliente WebSocket conectado: {client_info} (Total: {len(connected_clients)})")
+
     try:
         eventos = obtener_ultimos_eventos('crash', MAX_HISTORY)
         if eventos:
@@ -206,15 +259,21 @@ async def websocket_handler(websocket):
                 'api': 'crash',
                 'eventos': eventos
             }, default=str))
+            logger.info(f"📤 Historial enviado a {client_info} ({len(eventos)} eventos)")
         await websocket.wait_closed()
+    except websockets.exceptions.ConnectionClosed:
+        logger.info(f"🔌 Cliente desconectado: {client_info}")
+    except Exception as e:
+        logger.error(f"❌ Error en WebSocket handler: {e}")
     finally:
         connected_clients.remove(websocket)
+        logger.info(f"🔌 Cliente eliminado. Total conectados: {len(connected_clients)}")
 
 async def websocket_server():
     global websocket_loop
     port = int(os.environ.get('PORT', 8080))
     async with websockets.serve(websocket_handler, "0.0.0.0", port):
-        print(f"✅ Servidor WebSocket escuchando en puerto {port}")
+        logger.info(f"✅ Servidor WebSocket iniciado en puerto {port}")
         websocket_loop = asyncio.get_running_loop()
         while not stop_websocket.is_set():
             await asyncio.sleep(1)
@@ -225,7 +284,7 @@ def start_websocket_server():
     try:
         loop.run_until_complete(websocket_server())
     except Exception as e:
-        print(f"Error en WebSocket server: {e}")
+        logger.error(f"Error fatal en WebSocket server: {e}")
 
 threading.Thread(target=start_websocket_server, daemon=True).start()
 
@@ -243,15 +302,55 @@ def broadcast(event_data):
     asyncio.run_coroutine_threadsafe(_async_broadcast(message), websocket_loop)
 
 # ============================================
+# FUNCIÓN PARA LOGGEAR ESTADO DE GIROS
+# ============================================
+last_log_time = 0
+LOG_INTERVAL = 30  # Loggear estadísticas cada 30 segundos
+
+def log_estado_giros(forzar=False):
+    """Loggea el estado actual de los giros"""
+    global last_log_time
+
+    now = time.time()
+    if not forzar and now - last_log_time < LOG_INTERVAL:
+        return
+
+    last_log_time = now
+    stats = obtener_estadisticas_giros()
+
+    logger.info("=" * 60)
+    logger.info("🎰 ESTADÍSTICAS DE GIROS CRASH")
+    logger.info("=" * 60)
+    logger.info(f"📊 Total de giros registrados: {stats['total_giros']}")
+    logger.info(f"🎯 Promedio de multiplicadores: {stats['avg_multiplier']}x")
+    logger.info(f"⚡ Giros en última hora: {stats['giros_ultima_hora']}")
+    logger.info(f"🔢 Requests totales a API: {api_status['total_requests']}")
+    logger.info(f"🆕 Giros nuevos detectados: {api_status['total_giros_detectados']}")
+    logger.info(f"👥 Clientes WebSocket conectados: {len(connected_clients)}")
+
+    if stats['ultimo_multiplicador']:
+        logger.info(f"🎲 Último giro: {stats['ultimo_multiplicador']}x @ {stats['ultimo_startedAt']}")
+
+    logger.info("=" * 60)
+
+# ============================================
 # BUCLE PRINCIPAL (Crash únicamente)
 # ============================================
-print("🚀 Iniciando monitoreo de Crash. Presiona Ctrl+C para detener.")
+logger.info("🚀 Iniciando monitoreo de Crash...")
+logger.info("📡 Conectando a API: " + API_CRASH)
 
 crash_ids = set()
+giro_counter = 0
+
+# Loggear estado inicial
+log_estado_giros(forzar=True)
 
 try:
     while True:
         now = time.time()
+
+        # Loggear estado periódicamente
+        log_estado_giros()
 
         if now >= api_status['next_allowed_time']:
             crash_data = consultar_con_backoff(API_CRASH)
@@ -259,6 +358,9 @@ try:
                 api_id = crash_data.get('id')
                 if api_id and api_id not in crash_ids:
                     crash_ids.add(api_id)
+                    api_status['total_giros_detectados'] += 1
+                    giro_counter += 1
+
                     data_inner = crash_data.get('data', {})
                     result = data_inner.get('result', {})
                     max_mult = result.get('maxMultiplier')
@@ -267,26 +369,46 @@ try:
 
                     if max_mult is not None and max_mult > 0:
                         timestamp = guardar_evento('crash', api_id, max_mult, round_dur, started_at)
+
+                        # Log detallado del giro
+                        logger.info("-" * 50)
+                        logger.info(f"🎰 NUEVO GIRO DETECTADO (#{giro_counter})")
+                        logger.info(f"   📋 ID: {api_id}")
+                        logger.info(f"   💥 Multiplicador: {max_mult}x")
+                        logger.info(f"   ⏱️ Duración: {round_dur}s")
+                        logger.info(f"   🕐 Iniciado: {started_at}")
+                        logger.info(f"   💾 Guardado en DB: {timestamp}")
+                        logger.info("-" * 50)
+
                         broadcast({
                             'tipo': 'crash',
                             'id': api_id,
                             'maxMultiplier': max_mult,
                             'roundDuration': round_dur,
                             'startedAt': started_at,
-                            'timestamp_recepcion': timestamp
+                            'timestamp_recepcion': timestamp,
+                            'giro_numero': giro_counter
                         })
-                        print(f"✅ Crash nuevo: ID={api_id} maxMult={max_mult}")
                     else:
-                        print(f"⚠️ Crash ID {api_id} con multiplicador inválido: {max_mult}")
+                        logger.warning(f"⚠️ Giro ID {api_id} con multiplicador inválido: {max_mult}")
 
         wait = max(0, api_status['next_allowed_time'] - time.time())
         if wait > 0:
             jitter = random.uniform(0.9, 1.1)
-            time.sleep(wait * jitter)
+            sleep_time = wait * jitter
+            logger.debug(f"⏱️  Esperando {sleep_time:.2f}s (con jitter)")
+            time.sleep(sleep_time)
         else:
             time.sleep(0.5)
 
 except KeyboardInterrupt:
-    print("\n⏹ Monitoreo detenido por el usuario.")
+    logger.info("
+⏹ Monitoreo detenido por el usuario.")
+    log_estado_giros(forzar=True)
     stop_websocket.set()
     time.sleep(1)
+except Exception as e:
+    logger.exception(f"❌ Error fatal en bucle principal: {e}")
+    log_estado_giros(forzar=True)
+    stop_websocket.set()
+    raise
