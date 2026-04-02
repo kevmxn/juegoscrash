@@ -2,29 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor exclusivo para Crash con servidor HTTP y WebSocket
-- Polling a la API de Stake Crash
-- Almacena hasta 100,000 eventos en SQLite
-- Envía solo los últimos 100 eventos al conectar
-- Eventos en lotes de hasta 20 cada 1 segundo
-- Tabla de niveles enviada cada 60-120 segundos (aleatorio)
-- Persistencia con SQLite
-- Backoff exponencial y circuit breaker (estilo apis.py)
-- Auto‑ping cada 10 minutos
+Monitor simple para Crash - Compatible con Render
+- Polling a la API de Stake Crash con requests
+- Almacena eventos en SQLite
+- WebSocket para clientes
+- Auto-ping cada 10 minutos para mantener vivo el servidor en Render
 """
 
-import asyncio
-import aiohttp
-from aiohttp import web
-import json
+import requests
 import time
+import sqlite3
+import threading
+import asyncio
+import websockets
+import json
+import os
 import random
 import logging
-import os
 from datetime import datetime
-from typing import Set, Dict, Any, List
+from typing import Set
 from collections import defaultdict
-import aiosqlite
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,12 +31,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================
-# CONFIGURACIÓN Crash
+# CONFIGURACIÓN
 # ============================================
-API_Crash = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
+API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
 DB_PATH = "crash_data.db"
 
-# User Agents (misma lista extensa que en crashstake.py y apis.py)
+# User Agents
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
@@ -47,323 +44,296 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Firefox/78.0",
-    "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:60.0) Gecko/20100101 Firefox/60.0",
-    "Mozilla/5.0 (Windows NT 6.1; rv:52.0) Gecko/20100101 Firefox/52.0",
-    "Mozilla/5.0 (Windows NT 5.1; rv:45.0) Gecko/20100101 Firefox/45.0",
-    "Mozilla/5.0 (Windows NT 5.1; rv:38.0) Gecko/20100101 Firefox/38.0",
-    "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko/20100101 Firefox/11.0",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
-    "Mozilla/5.0 (Windows NT 6.3; Win64; x64; rv:56.0) Gecko/20100101 Firefox/56.0",
-    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:50.0) Gecko/20100101 Firefox/50.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/109.0 Waterfox/109.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:78.0) Gecko/20100101 Goanna/5.0 Firefox/78.0 PaleMoon/29.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
-    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
-    "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
-    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.1; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0)",
-    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E)",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/5.0 (Windows NT 6.1; Trident/7.0; rv:11.0) like Gecko",
-    "Mozilla/4.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
-    "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0; .NET CLR 2.0.50727; .NET CLR 3.0.4506.2152; .NET CLR 3.5.30729)",
-    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:68.0) Gecko/20100101 Firefox/68.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (X11; Linux i686; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:91.0) Gecko/20100101 Firefox/91.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
-    "Mozilla/5.0 (X11; Linux i686; rv:68.0) Gecko/20100101 Firefox/68.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0",
-    "Mozilla/5.0 (X11; Linux i686; rv:52.0) Gecko/20100101 Firefox/52.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:45.0) Gecko/20100101 Firefox/45.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:31.0) Gecko/20100101 Firefox/31.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:60.9) Gecko/20100101 Goanna/4.9 Firefox/60.9 PaleMoon/28.9.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:52.9) Gecko/20100101 Goanna/4.0 Firefox/52.9 Basilisk/2019.10.29",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 SeaMonkey/2.35",
-    "Mozilla/5.0 (X11; Linux i686; rv:2.0) Gecko/20100101 Firefox/4.0 SeaMonkey/2.1",
-    "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.2.28) Gecko/20120306 Firefox/3.6.28 (K-Meleon 1.5.4)",
 ]
 
 BASE_SLEEP = 1.0
 MAX_SLEEP = 60.0
-MAX_CONSECUTIVE_ERRORS = 10
-BLOCK_TIME = 300
 
-Crash_ids: Set[str] = set()
-Crash_status = {'consecutive_errors': 0, 'next_allowed_time': 0}
-Crash_history: list = []
-MAX_HISTORY = 100          # Solo se envían los últimos 100 al cliente
-MAX_STORAGE = 100000       # Se almacenan hasta 100,000 eventos en BD
+MAX_HISTORY = 100          # Últimos 100 eventos en memoria
+MAX_STORAGE = 100000       # Máximo en BD
 
+crash_ids: Set[str] = set()
+crash_history: list = []
 current_level = 0
 level_counts = defaultdict(lambda: {'3-4.99': 0, '5-9.99': 0, '10+': 0})
 
-connected_clients: Set[web.WebSocketResponse] = set()
+# Estado de la API
+api_status = {
+    'consecutive_errors': 0,
+    'next_allowed_time': 0
+}
 
-# Batching
-event_queue = asyncio.Queue()
-BATCH_SIZE = 20
-BATCH_TIMEOUT = 1.0
-
-TABLE_UPDATE_MIN = 60
-TABLE_UPDATE_MAX = 120
-
-# ============================================
-# FUNCIONES DE BASE DE DATOS
-# ============================================
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY,
-                maxMultiplier REAL,
-                startedAt TEXT,
-                timestamp_recepcion TEXT,
-                nivel INTEGER
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS counts (
-                level INTEGER,
-                range TEXT,
-                count INTEGER,
-                PRIMARY KEY (level, range)
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS state (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        ''')
-        await db.commit()
-
-async def load_from_db():
-    global Crash_history, Crash_ids, level_counts, current_level
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Cargar últimos 100 eventos en memoria
-        async with db.execute('SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,)) as cursor:
-            rows = await cursor.fetchall()
-            Crash_history = []
-            Crash_ids.clear()
-            for row in rows:
-                event = {
-                    'event_id': row[0],
-                    'maxMultiplier': row[1],
-                    'startedAt': row[2],
-                    'timestamp_recepcion': row[3],
-                    'nivel': row[4]
-                }
-                Crash_history.append(event)
-                Crash_ids.add(row[0])
-        # Cargar contadores y estado
-        async with db.execute('SELECT level, range, count FROM counts') as cursor:
-            rows = await cursor.fetchall()
-            level_counts.clear()
-            for level, rng, cnt in rows:
-                level_counts[level][rng] = cnt
-        async with db.execute('SELECT value FROM state WHERE key = "current_level"') as cursor:
-            row = await cursor.fetchone()
-            if row:
-                current_level = int(row[0])
-            else:
-                current_level = 0
-                await db.execute('INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)', ('current_level', '0'))
-                await db.commit()
-
-async def save_event(event: dict):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO events (id, maxMultiplier, startedAt, timestamp_recepcion, nivel)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (event['event_id'], event['maxMultiplier'], event.get('startedAt'), event['timestamp_recepcion'], event['nivel']))
-        # Mantener solo los últimos MAX_STORAGE eventos en BD
-        await db.execute('''
-            DELETE FROM events WHERE id NOT IN (
-                SELECT id FROM events ORDER BY timestamp_recepcion DESC LIMIT ?
-            )
-        ''', (MAX_STORAGE,))
-        await db.commit()
-
-async def update_count(level: int, range_key: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT INTO counts (level, range, count) VALUES (?, ?, 1)
-            ON CONFLICT(level, range) DO UPDATE SET count = count + 1
-        ''', (level, range_key))
-        await db.commit()
-
-async def update_current_level(level: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)
-        ''', ('current_level', str(level)))
-        await db.commit()
+# WebSocket
+connected_clients: Set[websockets.WebSocketServerProtocol] = set()
+websocket_loop = None
+stop_websocket = threading.Event()
 
 # ============================================
-# AUTO‑PING
+# BASE DE DATOS
 # ============================================
-async def self_ping():
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            maxMultiplier REAL,
+            startedAt TEXT,
+            timestamp_recepcion TEXT,
+            nivel INTEGER
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS counts (
+            level INTEGER,
+            range TEXT,
+            count INTEGER,
+            PRIMARY KEY (level, range)
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def load_from_db():
+    global crash_history, crash_ids, level_counts, current_level
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Cargar últimos 100 eventos
+    c.execute('SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel FROM events ORDER BY timestamp_recepcion DESC LIMIT ?', (MAX_HISTORY,))
+    rows = c.fetchall()
+    crash_history = []
+    crash_ids.clear()
+    for row in rows:
+        event = {
+            'event_id': row[0],
+            'maxMultiplier': row[1],
+            'startedAt': row[2],
+            'timestamp_recepcion': row[3],
+            'nivel': row[4]
+        }
+        crash_history.append(event)
+        crash_ids.add(row[0])
+    
+    # Cargar contadores
+    c.execute('SELECT level, range, count FROM counts')
+    rows = c.fetchall()
+    level_counts.clear()
+    for level, rng, cnt in rows:
+        level_counts[level][rng] = cnt
+    
+    # Cargar nivel actual
+    c.execute('SELECT value FROM state WHERE key = "current_level"')
+    row = c.fetchone()
+    if row:
+        current_level = int(row[0])
+    else:
+        c.execute('INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)', ('current_level', '0'))
+        conn.commit()
+    
+    conn.close()
+
+def save_event(event: dict):
+    """Guarda evento y resetea la BD si se alcanza el límite de 100,000"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Verificar cuántos eventos hay actualmente
+    c.execute('SELECT COUNT(*) FROM events')
+    count = c.fetchone()[0]
+    
+    # Si llegamos al límite, resetear la base manteniendo solo los últimos 100
+    if count >= MAX_STORAGE:
+        logger.warning(f"[BD] Límite de {MAX_STORAGE} alcanzado. Resetenado base de datos...")
+        
+        # Obtener los últimos 100 eventos
+        c.execute('''
+            SELECT id, maxMultiplier, startedAt, timestamp_recepcion, nivel 
+            FROM events 
+            ORDER BY timestamp_recepcion DESC 
+            LIMIT ?
+        ''', (MAX_HISTORY,))
+        last_100 = c.fetchall()
+        
+        # Cerrar conexión
+        conn.close()
+        
+        # Eliminar archivo de base de datos
+        try:
+            os.remove(DB_PATH)
+            logger.info(f"[BD] Archivo {DB_PATH} eliminado")
+        except Exception as e:
+            logger.error(f"[BD] Error al eliminar archivo: {e}")
+        
+        # Recrear base de datos
+        init_db()
+        
+        # Reconectar y guardar los últimos 100
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        for row in reversed(last_100):  # Revertir para mantener orden cronológico
+            c.execute('''
+                INSERT INTO events (id, maxMultiplier, startedAt, timestamp_recepcion, nivel)
+                VALUES (?, ?, ?, ?, ?)
+            ''', row)
+        
+        conn.commit()
+        logger.info(f"[BD] Base de datos recreada con {len(last_100)} eventos")
+    
+    # Insertar el nuevo evento
+    c.execute('''
+        INSERT OR REPLACE INTO events (id, maxMultiplier, startedAt, timestamp_recepcion, nivel)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (event['event_id'], event['maxMultiplier'], event.get('startedAt'), 
+          event['timestamp_recepcion'], event['nivel']))
+    
+    conn.commit()
+    conn.close()
+
+def update_count(level: int, range_key: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO counts (level, range, count) VALUES (?, ?, 1)
+        ON CONFLICT(level, range) DO UPDATE SET count = count + 1
+    ''', (level, range_key))
+    conn.commit()
+    conn.close()
+
+def update_current_level(level: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)
+    ''', ('current_level', str(level)))
+    conn.commit()
+    conn.close()
+
+# ============================================
+# AUTO-PING PARA RENDER
+# ============================================
+def self_ping():
+    """Auto-ping cada 10 minutos para mantener el servidor activo en Render"""
     port = int(os.environ.get('PORT', 10000))
     url = f"http://localhost:{port}/health"
-    while True:
-        await asyncio.sleep(600)
+    while not stop_websocket.is_set():
+        time.sleep(600)  # 10 minutos
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as resp:
-                    if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
-                    else:
-                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                logger.info("[PING] Auto-ping exitoso, servicio activo")
+            else:
+                logger.warning(f"[PING] Auto-ping falló con código {response.status_code}")
         except Exception as e:
-            logger.error(f"[PING] Error en auto‑ping: {e}")
+            logger.error(f"[PING] Error en auto-ping: {e}")
 
 # ============================================
-# BATCH SENDER
-# ============================================
-async def batch_sender():
-    pending_events = []
-    while True:
-        try:
-            event = await asyncio.wait_for(event_queue.get(), timeout=BATCH_TIMEOUT)
-            pending_events.append(event)
-            if len(pending_events) >= BATCH_SIZE:
-                await send_batch(pending_events.copy())
-                pending_events.clear()
-        except asyncio.TimeoutError:
-            if pending_events:
-                await send_batch(pending_events.copy())
-                pending_events.clear()
-        except Exception as e:
-            logger.error(f"Error en batch_sender: {e}")
-
-async def send_batch(events_list: List[dict]):
-    if not connected_clients:
-        return
-    batch_msg = {
-        'tipo': 'batch',
-        'eventos': events_list
-    }
-    message = json.dumps(batch_msg, default=str)
-    await asyncio.gather(
-        *[client.send_str(message) for client in connected_clients],
-        return_exceptions=True
-    )
-    logger.info(f"Enviado lote de {len(events_list)} eventos")
-
-# ============================================
-# PERIODIC TABLE SENDER
-# ============================================
-async def periodic_table_sender():
-    while True:
-        interval = random.uniform(TABLE_UPDATE_MIN, TABLE_UPDATE_MAX)
-        await asyncio.sleep(interval)
-        if not connected_clients:
-            continue
-        table_msg = {
-            'tipo': 'nivel_counts',
-            'nivel_actual': current_level,
-            'conteos': {k: dict(v) for k, v in level_counts.items()}
-        }
-        message = json.dumps(table_msg, default=str)
-        await asyncio.gather(
-            *[client.send_str(message) for client in connected_clients],
-            return_exceptions=True
-        )
-        logger.info(f"Tabla de niveles enviada (intervalo {interval:.1f}s)")
-
-# ============================================
-# FUNCIONES Crash (con backoff estilo apis.py)
+# FUNCIONES DE CONSULTA A LA API
 # ============================================
 def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
-async def consultar_Crash(session: aiohttp.ClientSession) -> dict | None:
+def consultar_crash():
+    """Consulta la API de Crash con backoff exponencial"""
+    global api_status
     now = time.time()
-    if now < Crash_status['next_allowed_time']:
-        wait = Crash_status['next_allowed_time'] - now
+    
+    if now < api_status['next_allowed_time']:
+        wait = api_status['next_allowed_time'] - now
         if wait > 0.5:
             logger.debug(f"[Crash] ⏳ Backoff {wait:.1f}s")
-        await asyncio.sleep(wait)
+        time.sleep(wait)
         return None
-
+    
     headers = {'User-Agent': get_random_user_agent()}
     try:
-        async with session.get(API_Crash, headers=headers, timeout=10) as resp:
-            if 'Retry-After' in resp.headers:
-                retry_after = int(resp.headers['Retry-After'])
-                Crash_status['next_allowed_time'] = time.time() + retry_after
-                Crash_status['consecutive_errors'] += 1
-                logger.warning(f"[Crash] ⚠️ Retry-After {retry_after}s")
-                return None
-
-            if resp.status == 200:
-                Crash_status['consecutive_errors'] = 0
-                return await resp.json()
-
-            elif resp.status == 403:
-                Crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
-                Crash_status['next_allowed_time'] = time.time() + backoff
-                logger.warning(f"[Crash] 🚫 403 Forbidden - backoff {backoff:.1f}s")
-                if Crash_status['consecutive_errors'] >= MAX_CONSECUTIVE_ERRORS:
-                    Crash_status['next_allowed_time'] = time.time() + BLOCK_TIME
-                    logger.error(f"[Crash] 🔒 Bloqueado {BLOCK_TIME}s")
-                return None
-
-            elif resp.status == 429:
-                retry_after = int(resp.headers.get('Retry-After', 2 ** Crash_status['consecutive_errors']))
-                Crash_status['next_allowed_time'] = time.time() + retry_after
-                Crash_status['consecutive_errors'] += 1
-                logger.warning(f"[Crash] ⚠️ Rate limit, esperar {retry_after}s")
-                return None
-
-            elif 500 <= resp.status < 600:
-                Crash_status['consecutive_errors'] += 1
-                backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
-                Crash_status['next_allowed_time'] = time.time() + backoff
-                logger.error(f"[Crash] ❌ Error {resp.status}, backoff {backoff:.1f}s")
-                return None
-
-            else:
-                logger.warning(f"[Crash] ⚠️ Código inesperado: {resp.status}")
-                return None
-
-    except asyncio.TimeoutError:
-        Crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
-        Crash_status['next_allowed_time'] = time.time() + backoff
+        resp = requests.get(API_CRASH, headers=headers, timeout=10)
+        
+        if 'Retry-After' in resp.headers:
+            retry_after = int(resp.headers['Retry-After'])
+            api_status['next_allowed_time'] = time.time() + retry_after
+            api_status['consecutive_errors'] += 1
+            logger.warning(f"[Crash] ⚠️ Retry-After {retry_after}s")
+            return None
+        
+        if resp.status_code == 200:
+            api_status['consecutive_errors'] = 0
+            return resp.json()
+        
+        elif resp.status_code == 403:
+            api_status['consecutive_errors'] += 1
+            backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
+            api_status['next_allowed_time'] = time.time() + backoff
+            logger.warning(f"[Crash] 🚫 403 Forbidden - backoff {backoff:.1f}s")
+            return None
+        
+        elif resp.status_code == 429:
+            retry_after = int(resp.headers.get('Retry-After', 2 ** api_status['consecutive_errors']))
+            api_status['next_allowed_time'] = time.time() + retry_after
+            api_status['consecutive_errors'] += 1
+            logger.warning(f"[Crash] ⚠️ Rate limit, esperar {retry_after}s")
+            return None
+        
+        elif 500 <= resp.status < 600:
+            api_status['consecutive_errors'] += 1
+            backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
+            api_status['next_allowed_time'] = time.time() + backoff
+            logger.error(f"[Crash] ❌ Error {resp.status_code}, backoff {backoff:.1f}s")
+            return None
+        
+        else:
+            logger.warning(f"[Crash] ⚠️ Código inesperado: {resp.status_code}")
+            return None
+    
+    except requests.exceptions.Timeout:
+        api_status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
+        api_status['next_allowed_time'] = time.time() + backoff
         logger.error(f"[Crash] ⏰ Timeout, backoff {backoff:.1f}s")
         return None
     except Exception as e:
-        Crash_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** Crash_status['consecutive_errors']))
-        Crash_status['next_allowed_time'] = time.time() + backoff
+        api_status['consecutive_errors'] += 1
+        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
+        api_status['next_allowed_time'] = time.time() + backoff
         logger.error(f"[Crash] 💥 Excepción: {e}")
         return None
 
-async def procesar_Crash(data: dict):
-    global current_level, Crash_history, level_counts
+def procesar_crash(data: dict):
+    """Procesa un evento de Crash"""
+    global current_level, crash_history, level_counts
+    
     event_id = data.get('id')
-    if not event_id or event_id in Crash_ids:
-        return
-    Crash_ids.add(event_id)
+    if not event_id or event_id in crash_ids:
+        return None
+    
+    crash_ids.add(event_id)
     data_inner = data.get('data', {})
     result = data_inner.get('result', {})
     max_mult = result.get('maxMultiplier')
     started_at = data_inner.get('startedAt')
+    
     if max_mult is not None and max_mult > 0:
         # Actualizar nivel
         if max_mult < 2.00:
             current_level -= 1
         else:
             current_level += 1
-
+        
         # Determinar rango
         range_key = None
         if 3.00 <= max_mult <= 4.99:
@@ -372,117 +342,175 @@ async def procesar_Crash(data: dict):
             range_key = '5-9.99'
         elif max_mult >= 10.00:
             range_key = '10+'
-
+        
         evento = {
-            'tipo': 'Crash',
+            'tipo': 'crash',
             'event_id': event_id,
             'maxMultiplier': max_mult,
             'startedAt': started_at,
             'timestamp_recepcion': datetime.now().isoformat(),
             'nivel': current_level
         }
-
+        
         # Actualizar memoria (últimos 100 eventos)
-        Crash_history.insert(0, evento)
-        if len(Crash_history) > MAX_HISTORY:
-            Crash_history.pop()
+        crash_history.insert(0, evento)
+        if len(crash_history) > MAX_HISTORY:
+            crash_history.pop()
+        
         if range_key:
             level_counts[current_level][range_key] += 1
-
-        # Guardar en BD (almacena hasta MAX_STORAGE)
-        await save_event(evento)
+        
+        # Guardar en BD
+        save_event(evento)
         if range_key:
-            await update_count(current_level, range_key)
-        await update_current_level(current_level)
-
-        logger.info(f"[Crash] ✅ NUEVO: ID={event_id} | {max_mult}x | Inicio={started_at} | Nivel={current_level}")
-        await event_queue.put(evento)
+            update_count(current_level, range_key)
+        update_current_level(current_level)
+        
+        logger.info(f"[Crash] ✅ NUEVO: ID={event_id} | {max_mult}x | Nivel={current_level}")
+        return evento
     else:
         logger.warning(f"[Crash] ⚠️ ID {event_id} mult inválido: {max_mult}")
+        return None
 
-async def monitor_Crash():
+def monitor_crash():
+    """Bucle principal de monitoreo"""
     logger.info("[Crash] 🚀 Iniciando monitor (intervalo ~2s con jitter)")
-    async with aiohttp.ClientSession() as session:
-        while True:
-            data = await consultar_Crash(session)
-            if data:
-                await procesar_Crash(data)
-                # Éxito: espera entre 1.5 y 2.5 segundos (jitter)
-                sleep_time = random.uniform(1.5, 2.5)
-                await asyncio.sleep(sleep_time)
-            else:
-                # Si falló, el backoff ya esperó, añadimos 1s extra para no saturar
-                await asyncio.sleep(1)
+    
+    while not stop_websocket.is_set():
+        data = consultar_crash()
+        if data:
+            evento = procesar_crash(data)
+            if evento:
+                # Enviar a WebSocket
+                broadcast({
+                    'tipo': 'nuevo_evento',
+                    'evento': evento
+                })
+            # Éxito: espera entre 1.5 y 2.5 segundos
+            sleep_time = random.uniform(1.5, 2.5)
+        else:
+            # Si falló, el backoff ya esperó, añadimos 1s extra
+            sleep_time = 1.0
+        
+        # Verificar si hay que detener
+        for _ in range(int(sleep_time * 10)):
+            if stop_websocket.is_set():
+                break
+            time.sleep(0.1)
 
 # ============================================
-# SERVIDOR HTTP + WEBSOCKET
+# SERVIDOR WEBSOCKET
 # ============================================
-async def websocket_handler(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    connected_clients.add(ws)
+async def websocket_handler(websocket, path):
+    """Maneja conexiones WebSocket"""
+    connected_clients.add(websocket)
     try:
-        if Crash_history:
-            await ws.send_json({
+        # Enviar historial al conectar
+        if crash_history:
+            await websocket.send(json.dumps({
                 'tipo': 'historial',
-                'api': 'Crash',
-                'eventos': Crash_history
-            })
-        await ws.send_json({
+                'api': 'crash',
+                'eventos': crash_history
+            }, default=str))
+        
+        # Enviar tabla de niveles
+        await websocket.send(json.dumps({
             'tipo': 'nivel_counts',
             'nivel_actual': current_level,
             'conteos': {k: dict(v) for k, v in level_counts.items()}
-        })
-        logger.info("Cliente Crash conectado, historial y tabla de niveles enviados")
-        async for msg in ws:
-            if msg.type == web.WSMsgType.CLOSE:
+        }, default=str))
+        
+        logger.info("Cliente conectado, historial y tabla enviados")
+        
+        # Mantener conexión abierta
+        while not stop_websocket.is_set():
+            try:
+                msg = await asyncio.wait_for(websocket.recv(), timeout=30)
+                # Procesar mensajes del cliente si es necesario
+            except asyncio.TimeoutError:
+                # Enviar ping para mantener conexión
+                try:
+                    await websocket.ping()
+                except:
+                    break
+            except websockets.exceptions.ConnectionClosed:
                 break
+    except Exception as e:
+        logger.error(f"Error en WebSocket: {e}")
     finally:
-        connected_clients.remove(ws)
-    return ws
+        connected_clients.remove(websocket)
+        logger.info("Cliente desconectado")
 
-async def health_handler(request):
-    return web.Response(text="OK", status=200)
+async def broadcast_async(message: dict):
+    """Envía mensaje a todos los clientes conectados"""
+    if not connected_clients:
+        return
+    
+    message_str = json.dumps(message, default=str)
+    await asyncio.gather(
+        *[client.send(message_str) for client in connected_clients],
+        return_exceptions=True
+    )
 
-async def root_handler(request):
-    return web.Response(text="Servidor crash activo. Use /ws para WebSocket o /health para health check.", status=200)
+def broadcast(message: dict):
+    """Función sincrónica para enviar mensajes desde el hilo de monitoreo"""
+    if websocket_loop is None or not connected_clients:
+        return
+    
+    asyncio.run_coroutine_threadsafe(broadcast_async(message), websocket_loop)
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/ws', websocket_handler)
-    app.router.add_get('/health', health_handler)
-    app.router.add_get('/', root_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
+async def websocket_server():
+    """Inicia el servidor WebSocket"""
+    global websocket_loop
     port = int(os.environ.get('PORT', 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logger.info(f"✅ Servidor crash escuchando en puerto {port}")
-    await asyncio.Future()
+    
+    async with websockets.serve(websocket_handler, "0.0.0.0", port):
+        logger.info(f"✅ Servidor WebSocket escuchando en puerto {port}")
+        websocket_loop = asyncio.get_running_loop()
+        
+        # Mantener servidor activo
+        while not stop_websocket.is_set():
+            await asyncio.sleep(1)
+
+def start_websocket_server():
+    """Inicia el servidor WebSocket en un hilo separado"""
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(websocket_server())
+    except Exception as e:
+        logger.error(f"Error en WebSocket server: {e}")
 
 # ============================================
 # MAIN
 # ============================================
-async def main():
+def main():
     logger.info("=" * 60)
-    logger.info("🚀 Monitor crash con almacenamiento 100k eventos, envío últimos 100")
+    logger.info("🚀 Monitor Crash - Sistema simple con auto-ping")
     logger.info("=" * 60)
-    await init_db()
-    await load_from_db()
-    asyncio.create_task(batch_sender())
-    asyncio.create_task(periodic_table_sender())
-    tasks = [
-        asyncio.create_task(start_web_server()),
-        asyncio.create_task(monitor_Crash()),
-        asyncio.create_task(self_ping()),
-    ]
+    
+    # Inicializar base de datos
+    init_db()
+    load_from_db()
+    
+    # Iniciar servidor WebSocket en hilo separado
+    ws_thread = threading.Thread(target=start_websocket_server, daemon=True)
+    ws_thread.start()
+    
+    # Esperar a que el servidor WebSocket esté listo
+    time.sleep(2)
+    
+    # Iniciar auto-ping en hilo separado
+    ping_thread = threading.Thread(target=self_ping, daemon=True)
+    ping_thread.start()
+    
+    # Iniciar monitoreo en el hilo principal
     try:
-        await asyncio.gather(*tasks)
+        monitor_crash()
     except KeyboardInterrupt:
         logger.info("\n⏹ Deteniendo...")
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        stop_websocket.set()
+        time.sleep(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
