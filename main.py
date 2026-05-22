@@ -1,9 +1,9 @@
-
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   SPACEMAN BOT — Señales de Continuación (2 intentos)       ║
 ║   WebSocket real | Orientado a Objetos | HTML para Telegram ║
+║   Corregido: Conflict 409, sesiones HTTP cerradas           ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -14,11 +14,12 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Set, Tuple
+from typing import Optional, List, Dict, Set
 from flask import Flask
 import websockets
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
+from telebot.asyncio_helper import ApiTelegramException
 import aiohttp
 
 # ─── LOGGING ──────────────────────────────────────────────────
@@ -58,7 +59,7 @@ class Config:
 
 class TrendAnalyzer:
     """Analiza la tendencia basada en multiplicadores recientes."""
-    
+
     def __init__(self, config: Config):
         self.config = config
         self.mults: List[Dict] = []   # cada uno: {'value': float, 'id': str, 'ts': float}
@@ -119,16 +120,16 @@ class TrendAnalyzer:
 
 class SignalEngine:
     """Motor de señales: acumulado, EMAs, condiciones y gestión de 2 intentos."""
-    
+
     def __init__(self, config: Config, trend_analyzer: TrendAnalyzer):
         self.config = config
         self.trend = trend_analyzer
-        
+
         # Datos para señales
         self.positions: List[int] = []        # acumulado +1/-1
         self.ema4: List[float] = []
         self.ema12: List[float] = []
-        
+
         # Señal pendiente
         self.signal_pending = {
             'active': False,
@@ -137,7 +138,7 @@ class SignalEngine:
             'observed_values': [],
             'max_bars': config.SIGNAL_MAX_BARS
         }
-        
+
         # Marcador diario
         self.daily_wins = 0
         self.daily_losses = 0
@@ -236,7 +237,10 @@ class SignalEngine:
         return sum(conditions) >= 3
 
     def add_multiplier(self, value: float, round_id: str):
-        """Procesa un nuevo multiplicador: actualiza posición, EMAs y evalúa señal/resolución."""
+        """
+        Procesa un nuevo multiplicador.
+        Retorna un evento (diccionario) si ocurre una señal o resolución, de lo contrario None.
+        """
         # Actualizar posición
         inc = self.update_position(value)
         self.positions.append(inc if self.positions else inc)
@@ -255,16 +259,14 @@ class SignalEngine:
             self.signal_pending['observed_values'].append(value)
             observed_len = len(self.signal_pending['observed_values'])
 
-            # ¿Acierto?
             if value >= self.config.WIN_TARGET:
-                self._resolve_signal(True)
-                return
-            # ¿Fallo por alcanzar máximo de velas?
+                # ACIERTO
+                return self._resolve_signal(True)
             if observed_len >= self.signal_pending['max_bars']:
-                self._resolve_signal(False)
-                return
+                # FALLO por alcanzar el máximo de velas
+                return self._resolve_signal(False)
             # Seguir esperando
-            return
+            return None
 
         # No hay señal pendiente: evaluar nueva señal
         if self.check_continuation_signal():
@@ -275,14 +277,13 @@ class SignalEngine:
                 'observed_values': [],
                 'max_bars': self.config.SIGNAL_MAX_BARS
             }
-            # Devolver evento de señal (será manejado por el bot)
             return {'type': 'signal', 'trigger': value}
         return None
 
     def _resolve_signal(self, is_win: bool):
-        """Resuelve la señal pendiente y devuelve evento de resolución."""
+        """Resuelve la señal pendiente y retorna evento de resolución."""
         trigger = self.signal_pending['trigger_value']
-        observed = self.signal_pending['observed_values'][:]  # copia
+        observed = self.signal_pending['observed_values'][:]
         self.signal_pending['active'] = False
         self.signal_pending['observed_values'] = []
         self.reset_daily_if_needed()
@@ -306,7 +307,7 @@ class SignalEngine:
 
 class TelegramBotHandler:
     """Maneja la interacción con Telegram: comandos, broadcasts, mensajes HTML."""
-    
+
     def __init__(self, config: Config, signal_engine: SignalEngine, trend_analyzer: TrendAnalyzer):
         self.config = config
         self.signal_engine = signal_engine
@@ -391,7 +392,7 @@ class TelegramBotHandler:
                 else:
                     logger.warning(f"Error en broadcast a {chat_id}: {e}")
         self.registered_chats.difference_update(dead)
-        # Canal fijo
+
         try:
             await self.bot.send_message(self.config.CHANNEL_ID, msg, parse_mode='HTML')
         except Exception as e:
@@ -440,13 +441,42 @@ class TelegramBotHandler:
             types.BotCommand('tendencia', '📈 Ver estado de la tendencia'),
         ])
 
-    async def infinity_polling(self):
-        await self.bot.infinity_polling(skip_pending=True)
+    async def infinity_polling(self, max_retries=5):
+        """Inicia el polling con eliminación de webhook y reintentos ante conflictos."""
+        # Eliminar webhook y actualizaciones pendientes
+        try:
+            await self.bot.delete_webhook()
+            logger.info("✅ Webhook eliminado correctamente")
+            # Limpiar actualizaciones antiguas
+            await self.bot.get_updates(offset=-1, timeout=1)
+            logger.info("✅ Actualizaciones pendientes limpiadas")
+        except Exception as e:
+            logger.warning(f"Error al limpiar webhook/updates: {e}")
+
+        retry = 0
+        while retry < max_retries:
+            try:
+                await self.bot.infinity_polling(skip_pending=True)
+                break  # Sale si el polling termina normalmente (raro)
+            except ApiTelegramException as e:
+                if "Conflict" in str(e) and "getUpdates" in str(e):
+                    retry += 1
+                    logger.warning(f"Conflicto de instancia (409), reintentando en 5 segundos... (intento {retry}/{max_retries})")
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"Error de Telegram no recuperable: {e}")
+                    raise
+            except Exception as e:
+                logger.error(f"Error inesperado en polling: {e}")
+                raise
+
+        if retry >= max_retries:
+            logger.critical("No se pudo iniciar el polling después de varios reintentos.")
 
 
 class WebSocketCollector:
     """Se conecta al WebSocket, recibe multiplicadores y los envía al motor de señales."""
-    
+
     def __init__(self, config: Config, signal_engine: SignalEngine, bot_handler: TelegramBotHandler):
         self.config = config
         self.signal_engine = signal_engine
@@ -537,7 +567,7 @@ class WebSocketCollector:
 
 class SpacemanBot:
     """Clase principal que orquesta todos los componentes."""
-    
+
     def __init__(self):
         self.config = Config()
         self.trend_analyzer = TrendAnalyzer(self.config)
@@ -588,14 +618,15 @@ class SpacemanBot:
             logger.info("RENDER_EXTERNAL_URL no configurada — self-ping desactivado")
             return
         url = f"{render_url.rstrip('/')}/ping"
-        while True:
-            await asyncio.sleep(14 * 60)
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                        logger.info(f"Self-ping OK: {r.status}")
-            except Exception as e:
-                logger.warning(f"Self-ping falló: {e}")
+        # Usar una sesión que se cierra automáticamente al salir del bloque
+        async with aiohttp.ClientSession() as session:
+            while True:
+                await asyncio.sleep(14 * 60)
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        logger.info(f"Self-ping OK: {resp.status}")
+                except Exception as e:
+                    logger.warning(f"Self-ping falló: {e}")
 
     async def run(self):
         logger.info("🤖 Iniciando SpacemanBot (Orientado a Objetos, HTML)")
@@ -608,7 +639,7 @@ class SpacemanBot:
         flask_thread = threading.Thread(target=self.run_flask, daemon=True)
         flask_thread.start()
         logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
-        # Iniciar polling de Telegram
+        # Iniciar polling de Telegram (con reintentos)
         await self.bot_handler.infinity_polling()
 
 
