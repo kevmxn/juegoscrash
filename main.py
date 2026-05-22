@@ -38,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "TU_TOKEN_AQUI")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
 
 # Endpoint HTTPS de Crash (Stake vía casino.org)
 API_CRASH  = "https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest"
