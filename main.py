@@ -2,8 +2,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║   SPACEMAN BOT — Señales de Continuación (2 intentos)       ║
-║   WebSocket real | Orientado a Objetos | HTML para Telegram ║
-║   Corregido: Conflict 409, sesiones HTTP cerradas           ║
+║   WebSocket real | Solo CANAL | HTML | Safe 1.50x           ║
+║   Eliminación de mensajes de tendencia en el canal          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -32,47 +32,40 @@ logger = logging.getLogger(__name__)
 
 class Config:
     """Configuración global del bot (modificable manualmente)."""
-    # Bot y canal
     BOT_TOKEN = "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo"
-    CHANNEL_ID = -1003613599867
+    CHANNEL_ID = -1003613599867      # Canal fijo
 
-    # WebSocket
     WS_URL = "wss://dga.pragmaticplaylive.net/ws"
     CASINO_ID = "ppcdk00000005349"
     CURRENCY = "BRL"
     GAME_ID = 1301
 
-    # Umbrales de juego
-    WIN_TARGET = 2.00
+    WIN_TARGET = 2.00          # Para cálculo de posición (+1/-1)
+    SAFE_TARGET = 1.50         # A partir de este valor se considera ganada la señal
     MAX_MULTS = 400
     TRIM_MULTS = 200
 
-    # Umbrales de tendencia (modificables)
-    THRESHOLD_1_199_MAX = 54.0   # Máximo % para 1.00-1.99x
-    THRESHOLD_2_499_MIN = 28.0   # Mínimo % para 2.00-4.99x
+    THRESHOLD_1_199_MAX = 54.0
+    THRESHOLD_2_499_MIN = 28.0
 
-    # Parámetros de señal
-    SIGNAL_MAX_BARS = 2          # Intentos (velas) para validar señal
+    SIGNAL_MAX_BARS = 2
     EMA_FAST = 4
     EMA_SLOW = 12
 
 
 class TrendAnalyzer:
-    """Analiza la tendencia basada en multiplicadores recientes."""
-
+    # ... (sin cambios, igual que antes)
     def __init__(self, config: Config):
         self.config = config
-        self.mults: List[Dict] = []   # cada uno: {'value': float, 'id': str, 'ts': float}
+        self.mults: List[Dict] = []
         self.current_favorable: Optional[bool] = None
 
     def add_multiplier(self, value: float, round_id: str):
-        """Agrega un nuevo multiplicador y mantiene tamaño máximo."""
         self.mults.append({'value': value, 'id': round_id, 'ts': time.time()})
         if len(self.mults) > self.config.MAX_MULTS:
             self.mults = self.mults[-self.config.TRIM_MULTS:]
 
     def get_stats(self, n: int = 200) -> dict:
-        """Estadísticas de los últimos n multiplicadores usando umbrales configurables."""
         data = self.mults[-n:] if len(self.mults) >= n else self.mults
         total = len(data)
         if total == 0:
@@ -81,19 +74,18 @@ class TrendAnalyzer:
                 'count_100_199': 0, 'count_200_499': 0,
                 'count_500_999': 0, 'count_1000_plus': 0,
                 'pct_100_199': 0.0, 'pct_200_499': 0.0,
+                'pct_500_999': 0.0, 'pct_1000_plus': 0.0,
             }
-
         r1 = sum(1 for m in data if 1.00 <= m['value'] < 2.00)
         r2 = sum(1 for m in data if 2.00 <= m['value'] < 5.00)
         r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
         r4 = sum(1 for m in data if m['value'] >= 10.00)
-
         pct1 = r1 / total * 100
         pct2 = r2 / total * 100
-
+        pct3 = r3 / total * 100
+        pct4 = r4 / total * 100
         unfavorable = (pct1 > self.config.THRESHOLD_1_199_MAX) or (pct2 < self.config.THRESHOLD_2_499_MIN)
         favorable = not unfavorable
-
         return {
             'total': total,
             'has_enough': total >= n,
@@ -104,10 +96,11 @@ class TrendAnalyzer:
             'count_1000_plus': r4,
             'pct_100_199': pct1,
             'pct_200_499': pct2,
+            'pct_500_999': pct3,
+            'pct_1000_plus': pct4,
         }
 
     def update_trend(self) -> Optional[bool]:
-        """Evalúa si hubo cambio de tendencia y retorna el nuevo estado o None si sin cambio."""
         stats = self.get_stats(200)
         if stats['total'] < 10:
             return None
@@ -119,27 +112,21 @@ class TrendAnalyzer:
 
 
 class SignalEngine:
-    """Motor de señales: acumulado, EMAs, condiciones y gestión de 2 intentos."""
-
+    # ... (sin cambios, igual que antes)
     def __init__(self, config: Config, trend_analyzer: TrendAnalyzer):
         self.config = config
         self.trend = trend_analyzer
-
-        # Datos para señales
-        self.positions: List[int] = []        # acumulado +1/-1
+        self.positions: List[int] = []
         self.ema4: List[float] = []
         self.ema12: List[float] = []
-
-        # Señal pendiente
         self.signal_pending = {
             'active': False,
             'created_index': -1,
             'trigger_value': 0.0,
             'observed_values': [],
-            'max_bars': config.SIGNAL_MAX_BARS
+            'max_bars': config.SIGNAL_MAX_BARS,
+            'second_attempt_sent': False
         }
-
-        # Marcador diario
         self.daily_wins = 0
         self.daily_losses = 0
         self.last_reset_date = None
@@ -195,97 +182,77 @@ class SignalEngine:
         return ema
 
     def check_continuation_signal(self) -> bool:
-        """Evalúa 5 condiciones; necesita al menos 3 verdaderas."""
         if len(self.positions) < 12 or len(self.ema4) < 12 or len(self.ema12) < 12:
             return False
-
         conditions = []
-
-        # 1. EMA4 > EMA12 y pendiente positiva de EMA4
         ema4_curr = self.ema4[-1]
         ema4_prev = self.ema4[-2] if len(self.ema4) > 1 else ema4_curr
         ema12_curr = self.ema12[-1]
         conditions.append(ema4_curr > ema12_curr and (ema4_curr - ema4_prev) > 0)
-
-        # 2. Mayoría alcista en últimas 8 velas
         last8 = self.positions[-8:] if len(self.positions) >= 8 else self.positions
         bullish_count = sum(1 for p in last8 if p == 1)
         conditions.append(bullish_count >= 5)
-
-        # 3. Fuerza mejorando (media últimas 4 > media previas 4)
         if len(self.trend.mults) >= 8:
             recent = [self.classify(m['value']) for m in self.trend.mults[-4:]]
             prev = [self.classify(m['value']) for m in self.trend.mults[-8:-4]]
             conditions.append(sum(recent)/4 > sum(prev)/4 - 0.1)
         else:
             conditions.append(False)
-
-        # 4. Pendiente del acumulado positiva (último vs hace 5)
         if len(self.positions) >= 5:
             conditions.append(self.positions[-1] - self.positions[-5] > 0)
         else:
             conditions.append(False)
-
-        # 5. Última vela alcista y fuerza positiva
         if len(self.positions) >= 2:
             inc = self.positions[-1] - self.positions[-2]
             last_force = self.classify(self.trend.mults[-1]['value']) if self.trend.mults else 0
             conditions.append(inc > 0 and last_force > 0)
         else:
             conditions.append(False)
-
         return sum(conditions) >= 3
 
     def add_multiplier(self, value: float, round_id: str):
-        """
-        Procesa un nuevo multiplicador.
-        Retorna un evento (diccionario) si ocurre una señal o resolución, de lo contrario None.
-        """
-        # Actualizar posición
         inc = self.update_position(value)
         self.positions.append(inc if self.positions else inc)
         self.trend.add_multiplier(value, round_id)
-
-        # Mantener tamaño
         if len(self.positions) > self.config.MAX_MULTS:
             self.positions = self.positions[-self.config.TRIM_MULTS:]
-
-        # Recalcular EMAs
         self.ema4 = self.calc_ema(self.positions, self.config.EMA_FAST)
         self.ema12 = self.calc_ema(self.positions, self.config.EMA_SLOW)
 
-        # Gestión de señal pendiente
         if self.signal_pending['active']:
             self.signal_pending['observed_values'].append(value)
             observed_len = len(self.signal_pending['observed_values'])
-
-            if value >= self.config.WIN_TARGET:
-                # ACIERTO
+            if value >= self.config.SAFE_TARGET:
                 return self._resolve_signal(True)
+            if observed_len == 1 and not self.signal_pending.get('second_attempt_sent', False):
+                self.signal_pending['second_attempt_sent'] = True
+                return {
+                    'type': 'second_attempt',
+                    'trigger': self.signal_pending['trigger_value'],
+                    'attempt': 2
+                }
             if observed_len >= self.signal_pending['max_bars']:
-                # FALLO por alcanzar el máximo de velas
                 return self._resolve_signal(False)
-            # Seguir esperando
             return None
 
-        # No hay señal pendiente: evaluar nueva señal
         if self.check_continuation_signal():
             self.signal_pending = {
                 'active': True,
                 'created_index': len(self.positions) - 1,
                 'trigger_value': value,
                 'observed_values': [],
-                'max_bars': self.config.SIGNAL_MAX_BARS
+                'max_bars': self.config.SIGNAL_MAX_BARS,
+                'second_attempt_sent': False
             }
-            return {'type': 'signal', 'trigger': value}
+            return {'type': 'signal', 'trigger': value, 'attempt': 1}
         return None
 
     def _resolve_signal(self, is_win: bool):
-        """Resuelve la señal pendiente y retorna evento de resolución."""
         trigger = self.signal_pending['trigger_value']
         observed = self.signal_pending['observed_values'][:]
         self.signal_pending['active'] = False
         self.signal_pending['observed_values'] = []
+        self.signal_pending['second_attempt_sent'] = False
         self.reset_daily_if_needed()
         if is_win:
             self.daily_wins += 1
@@ -306,14 +273,19 @@ class SignalEngine:
 
 
 class TelegramBotHandler:
-    """Maneja la interacción con Telegram: comandos, broadcasts, mensajes HTML."""
+    """
+    Maneja la interacción con Telegram.
+    - Los mensajes de señales, resoluciones y cambios de tendencia se envían SOLO al canal.
+    - Los comandos responden a los usuarios individuales (no afectan al canal).
+    """
 
     def __init__(self, config: Config, signal_engine: SignalEngine, trend_analyzer: TrendAnalyzer):
         self.config = config
         self.signal_engine = signal_engine
         self.trend = trend_analyzer
         self.bot = AsyncTeleBot(config.BOT_TOKEN)
-        self.registered_chats: Set[int] = set()
+        self.registered_chats: Set[int] = set()   # solo para comandos, no para señales
+        self.last_trend_msg_id: Optional[int] = None   # ID del último mensaje de tendencia en el canal
         self._setup_handlers()
 
     def _setup_handlers(self):
@@ -337,11 +309,12 @@ class TelegramBotHandler:
             f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
             "🤖 <b>Bot de Señales Spaceman</b>\n"
             "🎯 Sistema de continuación alcista | 2 intentos\n"
+            f"🛡️ <b>Objetivo seguro: ≥{self.config.SAFE_TARGET:.2f}x</b>\n"
             "<b>📊 Umbrales de tendencia configurados:</b>\n"
             f"   • 1.00-1.99x: ≤{self.config.THRESHOLD_1_199_MAX:.0f}%\n"
             f"   • 2.00-4.99x: ≥{self.config.THRESHOLD_2_499_MIN:.0f}%\n"
-            "🔔 Recibirás señales en tiempo real.\n"
-            "📊 Usa /estadisticas o /tendencia para más información."
+            "🔔 Las señales se envían al canal.\n"
+            "📊 Usa /estadisticas o /tendencia para consultar."
         )
         await self.bot.reply_to(message, msg, parse_mode='HTML')
 
@@ -378,39 +351,39 @@ class TelegramBotHandler:
         )
         await self.bot.reply_to(message, respuesta, parse_mode='HTML')
 
-    async def broadcast(self, msg: str):
-        """Envía mensaje a todos los chats registrados y al canal fijo."""
-        dead = set()
-        for chat_id in list(self.registered_chats):
-            try:
-                await self.bot.send_message(chat_id, msg, parse_mode='HTML')
-            except Exception as e:
-                err = str(e).lower()
-                if any(x in err for x in ('blocked', 'not found', 'deactivated', 'kicked')):
-                    dead.add(chat_id)
-                    logger.warning(f"Chat {chat_id} inactivo → removido")
-                else:
-                    logger.warning(f"Error en broadcast a {chat_id}: {e}")
-        self.registered_chats.difference_update(dead)
-
+    async def send_to_channel(self, msg: str, delete_previous_trend: bool = False):
+        """
+        Envía un mensaje al canal fijo.
+        Si delete_previous_trend es True, elimina el último mensaje de tendencia antes de enviar el nuevo.
+        """
+        chat_id = self.config.CHANNEL_ID
         try:
-            await self.bot.send_message(self.config.CHANNEL_ID, msg, parse_mode='HTML')
+            if delete_previous_trend and self.last_trend_msg_id is not None:
+                try:
+                    await self.bot.delete_message(chat_id, self.last_trend_msg_id)
+                    logger.debug(f"Mensaje de tendencia anterior eliminado en canal {chat_id}")
+                except Exception as e:
+                    logger.debug(f"No se pudo eliminar mensaje anterior en canal: {e}")
+            sent = await self.bot.send_message(chat_id, msg, parse_mode='HTML')
+            if delete_previous_trend:
+                self.last_trend_msg_id = sent.message_id
         except Exception as e:
-            logger.error(f"No se pudo enviar al canal {self.config.CHANNEL_ID}: {e}")
+            logger.error(f"Error enviando mensaje al canal {chat_id}: {e}")
 
-    async def send_signal_message(self, trigger: float):
+    async def send_signal_message(self, trigger: float, attempt: int):
         msg = (
             f"🚨 <b>Entrar después de:</b> <code>{trigger:.2f}x</code>\n"
             f"💎 <b>Señal para 2.00x</b>\n"
-            f"🆔 <b>Gestión C3 — Intento 1/2</b>"
+            f"⚪ <b>Seguro en 1.50x</b>\n"
+            f"🆔 <b>Intento {attempt}/2</b>"
         )
-        await self.broadcast(msg)
+        await self.send_to_channel(msg)
 
     async def send_resolution_message(self, is_win: bool, trigger: float, observed: List[float]):
         if is_win:
             winning_value = observed[-1]
-            attempt_index = len(observed) - 1
-            result_line = f"✅ WIN GALE #{attempt_index} — {winning_value:.2f}x"
+            attempt_index = len(observed)  # 1 o 2
+            result_line = f"✅ WIN GALE #{attempt_index-1} — {winning_value:.2f}x"
         else:
             if len(observed) >= 2:
                 result_line = f"❌ LOSS {observed[0]:.2f}x — {observed[1]:.2f}x"
@@ -424,7 +397,7 @@ class TelegramBotHandler:
             f"📈 ACIERTOS = <code>{stats['win_rate']:.2f}%</code>"
         )
         full_msg = f"{result_line}\n\n{marcador}"
-        await self.broadcast(full_msg)
+        await self.send_to_channel(full_msg)
 
     async def send_trend_change(self, favorable: bool):
         hora = (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
@@ -432,7 +405,8 @@ class TelegramBotHandler:
             msg = f"🟢 <b>TENDENCIA FAVORABLE</b> {hora}\nUmbrales: ≤{self.config.THRESHOLD_1_199_MAX:.0f}% para 1.00-1.99x | ≥{self.config.THRESHOLD_2_499_MIN:.0f}% para 2.00-4.99x"
         else:
             msg = f"🔴 <b>TENDENCIA DESFAVORABLE</b> {hora}\nUmbrales: ≤{self.config.THRESHOLD_1_199_MAX:.0f}% para 1.00-1.99x | ≥{self.config.THRESHOLD_2_499_MIN:.0f}% para 2.00-4.99x"
-        await self.broadcast(msg)
+        # Enviar al canal y eliminar el mensaje anterior de tendencia
+        await self.send_to_channel(msg, delete_previous_trend=True)
 
     async def set_commands(self):
         await self.bot.set_my_commands([
@@ -442,27 +416,34 @@ class TelegramBotHandler:
         ])
 
     async def infinity_polling(self, max_retries=5):
-        """Inicia el polling con eliminación de webhook y reintentos ante conflictos."""
-        # Eliminar webhook y actualizaciones pendientes
         try:
             await self.bot.delete_webhook()
-            logger.info("✅ Webhook eliminado correctamente")
-            # Limpiar actualizaciones antiguas
+            await asyncio.sleep(2)
             await self.bot.get_updates(offset=-1, timeout=1)
-            logger.info("✅ Actualizaciones pendientes limpiadas")
+            logger.info("✅ Webhook y updates limpiados")
         except Exception as e:
-            logger.warning(f"Error al limpiar webhook/updates: {e}")
+            logger.warning(f"Limpieza inicial falló: {e}")
 
         retry = 0
         while retry < max_retries:
             try:
+                logger.info(f"Iniciando polling (intento {retry+1}/{max_retries})...")
                 await self.bot.infinity_polling(skip_pending=True)
-                break  # Sale si el polling termina normalmente (raro)
+                return
             except ApiTelegramException as e:
                 if "Conflict" in str(e) and "getUpdates" in str(e):
                     retry += 1
-                    logger.warning(f"Conflicto de instancia (409), reintentando en 5 segundos... (intento {retry}/{max_retries})")
-                    await asyncio.sleep(5)
+                    logger.warning(f"Conflicto 409 - Reintento {retry}/{max_retries}")
+                    if retry < max_retries:
+                        try:
+                            await self.bot.delete_webhook()
+                            await self.bot.get_updates(offset=-1, timeout=1)
+                        except:
+                            pass
+                        await asyncio.sleep(12)
+                    else:
+                        logger.critical("No se pudo resolver el conflicto. Revisa que no haya otra instancia corriendo.")
+                        raise
                 else:
                     logger.error(f"Error de Telegram no recuperable: {e}")
                     raise
@@ -470,13 +451,8 @@ class TelegramBotHandler:
                 logger.error(f"Error inesperado en polling: {e}")
                 raise
 
-        if retry >= max_retries:
-            logger.critical("No se pudo iniciar el polling después de varios reintentos.")
-
 
 class WebSocketCollector:
-    """Se conecta al WebSocket, recibe multiplicadores y los envía al motor de señales."""
-
     def __init__(self, config: Config, signal_engine: SignalEngine, bot_handler: TelegramBotHandler):
         self.config = config
         self.signal_engine = signal_engine
@@ -529,23 +505,22 @@ class WebSocketCollector:
                             self.seen_ids.add(round_id)
                             self.last_value = value
 
-                            # Procesar el multiplicador
                             event = self.signal_engine.add_multiplier(value, round_id)
                             if event:
                                 if event['type'] == 'signal':
-                                    await self.bot.send_signal_message(event['trigger'])
+                                    await self.bot.send_signal_message(event['trigger'], event['attempt'])
+                                elif event['type'] == 'second_attempt':
+                                    await self.bot.send_signal_message(event['trigger'], event['attempt'])
                                 elif event['type'] == 'resolution':
                                     await self.bot.send_resolution_message(
                                         event['is_win'], event['trigger'], event['observed']
                                     )
 
-                            # Limpiar IDs viejos
                             if len(self.seen_ids) > 2000:
                                 oldest = sorted(self.seen_ids)[:1000]
                                 for oid in oldest:
                                     self.seen_ids.discard(oid)
 
-                            # Verificar cambio de tendencia periódicamente
                             if len(self.signal_engine.trend.mults) % 10 == 0:
                                 new_trend = self.signal_engine.trend.update_trend()
                                 if new_trend is not None:
@@ -566,8 +541,6 @@ class WebSocketCollector:
 
 
 class SpacemanBot:
-    """Clase principal que orquesta todos los componentes."""
-
     def __init__(self):
         self.config = Config()
         self.trend_analyzer = TrendAnalyzer(self.config)
@@ -583,7 +556,6 @@ class SpacemanBot:
             return (
                 f"🤖 SpacemanBot | Velas: {len(self.trend_analyzer.mults)} | "
                 f"Señal pendiente: {self.signal_engine.signal_pending['active']} | "
-                f"Chats: {len(self.bot_handler.registered_chats)} | "
                 f"Marcador: {self.signal_engine.daily_wins}/{self.signal_engine.daily_losses}"
             ), 200
 
@@ -605,7 +577,8 @@ class SpacemanBot:
                 "thresholds": {
                     "1.00-1.99_max": self.config.THRESHOLD_1_199_MAX,
                     "2.00-4.99_min": self.config.THRESHOLD_2_499_MIN
-                }
+                },
+                "safe_target": self.config.SAFE_TARGET
             }
 
     def run_flask(self):
@@ -618,28 +591,24 @@ class SpacemanBot:
             logger.info("RENDER_EXTERNAL_URL no configurada — self-ping desactivado")
             return
         url = f"{render_url.rstrip('/')}/ping"
-        # Usar una sesión que se cierra automáticamente al salir del bloque
-        async with aiohttp.ClientSession() as session:
-            while True:
-                await asyncio.sleep(14 * 60)
-                try:
+        while True:
+            await asyncio.sleep(14 * 60)
+            try:
+                async with aiohttp.ClientSession() as session:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         logger.info(f"Self-ping OK: {resp.status}")
-                except Exception as e:
-                    logger.warning(f"Self-ping falló: {e}")
+            except Exception as e:
+                logger.warning(f"Self-ping falló: {e}")
 
     async def run(self):
-        logger.info("🤖 Iniciando SpacemanBot (Orientado a Objetos, HTML)")
+        logger.info("🤖 Iniciando SpacemanBot (Solo canal, Safe Target 1.50x)")
         logger.info(f"📊 Umbrales: 1.00-1.99x ≤{self.config.THRESHOLD_1_199_MAX}% | 2.00-4.99x ≥{self.config.THRESHOLD_2_499_MIN}%")
         await self.bot_handler.set_commands()
-        # Iniciar tareas asíncronas
         asyncio.create_task(self.ws_collector.run())
         asyncio.create_task(self.self_ping_loop())
-        # Iniciar Flask en hilo separado
         flask_thread = threading.Thread(target=self.run_flask, daemon=True)
         flask_thread.start()
         logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
-        # Iniciar polling de Telegram (con reintentos)
         await self.bot_handler.infinity_polling()
 
 
