@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║   CRASH BOT — Estrategia Maestro + Filtro Moderado (solo alertas 2.00x)     ║
-║   Se emiten señales solo cuando Maestro da 'low' y Moderado detecta 2.00x   ║
+║   Umbrales de tendencia editables al inicio del código                      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN
+# CONFIGURACIÓN PRINCIPAL (edita aquí los umbrales de tendencia)
 # ─────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
 API_CRASH  = "https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest"
@@ -47,7 +47,12 @@ BASE_BET    = 0.10
 
 MAESTRO_MIN_CONFIDENCE = 0.55
 MAESTRO_HISTORY_SIZE   = 100
-MODERATE_MIN_DATA      = 20   # datos mínimos para el filtro moderado
+MODERATE_MIN_DATA      = 20
+
+# ─── UMBRALES DE TENDENCIA (ajústalos aquí) ─────────────────────────────────
+UMBRAL_PCT_ROJO_MAX = 54.0   # Si % de cuotas <2.00 supera esto → tendencia desfavorable
+UMBRAL_PCT_VERDE_MIN = 28.0  # Si % de cuotas 2.00-4.99 es menor a esto → tendencia desfavorable
+# ─────────────────────────────────────────────────────────────────────────────
 
 POLL_INTERVAL_OK  = 3.0
 POLL_MAX_SLEEP    = 60.0
@@ -115,8 +120,6 @@ def update_daily_stats(win: bool):
 # ESTRATEGIA MODERADA (filtro exclusivo para alertas 2.00x)
 # ─────────────────────────────────────────────────────────────────────────────
 class ModerateStrategy:
-    """Detecta alertas moderadas de 2.00x (ignora 1.50)"""
-
     @staticmethod
     def compute_positions(values: List[float]) -> List[int]:
         positions = [0]
@@ -141,10 +144,6 @@ class ModerateStrategy:
 
     @classmethod
     def check_alerts(cls, values: List[float]) -> Tuple[bool, Optional[float]]:
-        """
-        Retorna (True, 2.00) si se detecta una alerta moderada de 2.00x,
-        de lo contrario (False, None).
-        """
         if len(values) < MODERATE_MIN_DATA:
             return False, None
 
@@ -162,20 +161,16 @@ class ModerateStrategy:
         prev_ema8     = emas[8][-2]
         prev_ema20    = emas[20][-2]
 
-        # Condiciones para alerta 2.00 (igual que en el HTML)
         alert_200 = False
 
-        # Cruce EMA8 por encima de EMA20
         if prev_ema8 <= prev_ema20 and last_ema8 > last_ema20:
             alert_200 = True
 
-        # Patrón de tres puntos (valle) con precio sobre EMAs
         if not alert_200 and len(positions) >= 3:
             a, b, c = positions[-3:]
             if abs(a - c) <= 1 and b > a and last_pos > last_ema4 and last_pos > last_ema8 and last_pos > last_ema20:
                 alert_200 = True
 
-        # Dos verdes consecutivos y EMAs en orden (4>8>20)
         if not alert_200 and len(values) >= 2 and values[-1] >= WIN_TARGET and values[-2] >= WIN_TARGET:
             if last_ema4 > last_ema8 > last_ema20 and (len(values) < 3 or values[-3] < WIN_TARGET):
                 alert_200 = True
@@ -381,13 +376,6 @@ class MaestroStrategy:
         return {'support': support, 'resistance': resistance}
 
     def should_enter(self, results: List[Dict]) -> Tuple[bool, float, str]:
-        """
-        Señal SÓLO si:
-          • risk == 'low'
-          • confidence >= MAESTRO_MIN_CONFIDENCE
-          • EMA no está en cruce bajista activo
-          • ** Existe alerta moderada de 2.00x **
-        """
         if len(results) < 3:
             return False, 0.0, "Datos insuficientes"
         trend = self.analyze_trend(results)
@@ -398,7 +386,6 @@ class MaestroStrategy:
             return False, conf, f"Bloqueado: cruce EMA bajista | {ema.get('ema_label','')}"
         if trend['risk'] != 'low' or conf < MAESTRO_MIN_CONFIDENCE:
             return False, conf, trend['detail']
-        # ─── FILTRO MODERADO (solo alertas 2.00x) ───
         values = [r['value'] for r in results[:50]]
         alerta_200, target = ModerateStrategy.check_alerts(values)
         if not alerta_200:
@@ -511,7 +498,7 @@ def reset_global_session():
     logger.info("🔄 Sesión global reiniciada — fichas preservadas")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCIONES AUXILIARES
+# FUNCIONES AUXILIARES (con umbrales configurables)
 # ─────────────────────────────────────────────────────────────────────────────
 def argentina_time() -> str:
     return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
@@ -528,7 +515,8 @@ def get_quota_stats(n: int = 200) -> dict:
     r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
     r4 = sum(1 for m in data if m['value'] >= 10.00)
     pct1, pct2, pct3, pct4 = r1/total*100, r2/total*100, r3/total*100, r4/total*100
-    unfavorable = pct1 > 54.0 or pct2 < 28.0
+    # Uso de variables editables
+    unfavorable = pct1 > UMBRAL_PCT_ROJO_MAX or pct2 < UMBRAL_PCT_VERDE_MIN
     return {
         'total': total, 'has_enough': total >= 200, 'favorable': not unfavorable,
         'count_100_199': r1, 'count_200_499': r2, 'count_500_999': r3, 'count_1000_plus': r4,
@@ -539,8 +527,8 @@ def quota_stats_text(stats: dict) -> str:
     if stats['total'] == 0:
         return "📡 _Sin datos suficientes para analizar cuotas._\n"
     n_label = "200" if stats['has_enough'] else f"{stats['total']} (acumulando...)"
-    r1_flag = " ✅" if stats['pct_100_199'] <= 54.0 else " ❌"
-    r2_flag = " ✅" if stats['pct_200_499'] >= 28.0 else " ❌"
+    r1_flag = " ✅" if stats['pct_100_199'] <= UMBRAL_PCT_ROJO_MAX else " ❌"
+    r2_flag = " ✅" if stats['pct_200_499'] >= UMBRAL_PCT_VERDE_MIN else " ❌"
     fav_line = "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_" if stats['favorable'] else "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
     return (f"📈 *Análisis de la Tendencia últimos*\n"
             f"      *{n_label} multiplicadores*\n"
@@ -769,48 +757,23 @@ async def http_poller():
                 g_poller_status['consecutive_errors'] = consecutive_errors
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD WEB (mismo que antes, se omite por brevedad pero se incluye igual)
+# DASHBOARD WEB (sencillo)
 # ─────────────────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
-MAESTRO_HTML = r"""<!DOCTYPE html>
+MAESTRO_HTML = """<!DOCTYPE html>
 <html>
-<head>
-<meta charset="UTF-8">
-<title>Maestro Crash - Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<style>
-/* ... (estilos idénticos al original) ... */
-</style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1>Maestro Crash <span class="badge">LIVE</span></h1>
-    <div class="subtitle">Stake Crash · Bot Automático + Filtro Moderado 2.00x</div>
-  </div>
-  <!-- Resto del dashboard idéntico al original -->
-</div>
-<script>
-// ... (mismo JavaScript que antes) ...
-</script>
-</body>
-</html>
-"""
+<head><meta charset="UTF-8"><title>Maestro Crash</title></head>
+<body><h1>Maestro Crash activo</h1><p>API funcionando</p></body>
+</html>"""
 
 @flask_app.route('/')
 def home():
-    elapsed = f"{int(time.time()-g_poller_status['last_round_ts'])}s" if g_poller_status['last_round_ts'] else "—"
-    return f"🤖 CrashBot Maestro ACTIVO | Datos: {len(g_mults)}/400 | Señal: {g_signal_state} | Giros: {g_poller_status['total_new_rounds']} | Último: {elapsed}", 200
+    return "Bot activo", 200
 
 @flask_app.route('/ping')
 def ping():
     return "pong", 200
-
-@flask_app.route('/maestro')
-def maestro_dashboard():
-    return render_template_string(MAESTRO_HTML)
 
 @flask_app.route('/api/maestro_data')
 def api_maestro_data():
@@ -863,6 +826,9 @@ async def self_ping_loop():
         except Exception:
             pass
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HANDLERS TELEGRAM (comandos sin acentos)
+# ─────────────────────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
     name = message.from_user.first_name or "usuario"
@@ -877,14 +843,15 @@ async def cmd_start(message):
         f"🎯 Objetivo: `{WIN_TARGET:.2f}x` | Gestión: 3C×2I\n"
         f"💰 Apuesta base: `${BASE_BET:.2f}`\n"
         f"🧠 Confianza mínima: `{MAESTRO_MIN_CONFIDENCE*100:.0f}%` | Señales solo cuando Maestro da 'low' y Moderado detecta 2.00x\n"
+        f"📊 Umbrales tendencia: rojo > {UMBRAL_PCT_ROJO_MAX:.1f}% o verde < {UMBRAL_PCT_VERDE_MIN:.1f}% → desfavorable\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📢 *Señales en el canal oficial*\n"
-        "🤖 *Comandos:* /señal /estadisticas /tendencia\n"
+        "🤖 *Comandos:* /senal /estadisticas /tendencia\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n{stats_blk}",
         parse_mode='Markdown')
 
-@bot.message_handler(commands=['señal'])
+@bot.message_handler(commands=['senal'])
 async def cmd_signal(message):
     if not g_maestro_results:
         await bot.reply_to(message, "📡 *Maestro*: Aún no hay suficientes datos.", parse_mode='Markdown')
@@ -946,12 +913,16 @@ async def cmd_tendencia(message):
     stats = get_quota_stats(200)
     await bot.reply_to(message, quota_stats_text(stats), parse_mode='Markdown')
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 async def main_async():
-    logger.info("🎭 Iniciando CrashBot Maestro + Filtro Moderado (solo 2.00x)")
+    logger.info(f"🎭 Iniciando CrashBot Maestro + Filtro Moderado (solo 2.00x)")
+    logger.info(f"📊 Umbrales de tendencia: rojo > {UMBRAL_PCT_ROJO_MAX}%  |  verde < {UMBRAL_PCT_VERDE_MIN}%")
     reset_daily_if_needed()
     await bot.set_my_commands([
         types.BotCommand('start', '🚀 Iniciar'),
-        types.BotCommand('señal', '🎯 Última predicción Maestro'),
+        types.BotCommand('senal', '🎯 Última predicción Maestro'),
         types.BotCommand('estadisticas', '📊 Estadísticas y fichas'),
         types.BotCommand('tendencia', '📈 Tendencia de cuotas'),
     ])
