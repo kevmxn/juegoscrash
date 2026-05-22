@@ -1,9 +1,10 @@
+
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║   CRASH BOT — Estrategia Maestro + Filtro Moderado (solo alertas 2.00x)     ║
-║   Umbrales de tendencia editables al inicio del código                      ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║   SPACEMAN BOT — Señales de Continuación (2 intentos)       ║
+║   WebSocket real | Orientado a Objetos | HTML para Telegram ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
 import asyncio
@@ -11,927 +12,606 @@ import threading
 import json
 import logging
 import os
-import random
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, List, Dict, Any
-
-import aiohttp
-from flask import Flask, jsonify, render_template_string
+from typing import Optional, List, Dict, Set, Tuple
+from flask import Flask
+import websockets
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
+import aiohttp
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── LOGGING ──────────────────────────────────────────────────
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN PRINCIPAL (edita aquí los umbrales de tendencia)
-# ─────────────────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
-API_CRASH  = "https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest"
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003613599867"))
 
-WIN_TARGET  = 2.00
-MAX_MULTS   = 400
-TRIM_MULTS  = 200
-MAX_COLS    = 3
-MAX_ATTS    = 2
-CYCLE_SIZE  = 10
-BASE_BET    = 0.10
+class Config:
+    """Configuración global del bot (modificable manualmente)."""
+    # Bot y canal
+    BOT_TOKEN = "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo"
+    CHANNEL_ID = -1003613599867
 
-MAESTRO_MIN_CONFIDENCE = 0.55
-MAESTRO_HISTORY_SIZE   = 100
-MODERATE_MIN_DATA      = 20
+    # WebSocket
+    WS_URL = "wss://dga.pragmaticplaylive.net/ws"
+    CASINO_ID = "ppcdk00000005349"
+    CURRENCY = "BRL"
+    GAME_ID = 1301
 
-# ─── UMBRALES DE TENDENCIA (ajústalos aquí) ─────────────────────────────────
-UMBRAL_PCT_ROJO_MAX = 54.0   # Si % de cuotas <2.00 supera esto → tendencia desfavorable
-UMBRAL_PCT_VERDE_MIN = 28.0  # Si % de cuotas 2.00-4.99 es menor a esto → tendencia desfavorable
-# ─────────────────────────────────────────────────────────────────────────────
+    # Umbrales de juego
+    WIN_TARGET = 2.00
+    MAX_MULTS = 400
+    TRIM_MULTS = 200
 
-POLL_INTERVAL_OK  = 3.0
-POLL_MAX_SLEEP    = 60.0
-POLL_BACKOFF_BASE = 2.0
+    # Umbrales de tendencia (modificables)
+    THRESHOLD_1_199_MAX = 54.0   # Máximo % para 1.00-1.99x
+    THRESHOLD_2_499_MIN = 28.0   # Mínimo % para 2.00-4.99x
 
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.3 Safari/605.1.15',
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ESTADO GLOBAL
-# ─────────────────────────────────────────────────────────────────────────────
-g_mults:     list = []
-g_seen_ids:  set  = set()
-
-g_signal_state        = 'idle'
-g_signal_trigger_mult = 0.0
-
-g_trend_favorable:    Optional[bool] = None
-g_signal_msg_ids:     dict           = {}
-g_last_trend_msg_id:  Optional[int]  = None
-
-g_maestro_results: list = []
-g_maestro_last_prediction: dict = {}
-
-g_poller_status = {
-    'total_requests':    0,
-    'total_new_rounds':  0,
-    'consecutive_errors': 0,
-    'last_poll_ts':      0.0,
-    'last_round_ts':     0.0,
-}
-
-daily_stats = {'date': None, 'wins': 0, 'losses': 0}
-
-bot = AsyncTeleBot(BOT_TOKEN)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MARCADOR DIARIO
-# ─────────────────────────────────────────────────────────────────────────────
-def get_current_argentina_date() -> str:
-    return (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
-
-def reset_daily_if_needed():
-    global daily_stats
-    today = get_current_argentina_date()
-    if daily_stats['date'] != today:
-        daily_stats = {'date': today, 'wins': 0, 'losses': 0}
-        logger.info(f"📆 Marcador diario reiniciado para {today}")
-
-def update_daily_stats(win: bool):
-    reset_daily_if_needed()
-    if win:
-        daily_stats['wins'] += 1
-    else:
-        daily_stats['losses'] += 1
-    total = daily_stats['wins'] + daily_stats['losses']
-    accuracy = daily_stats['wins'] / total * 100 if total > 0 else 0
-    msg = f"📊 MARCADOR DIARIO:\n✅ GANADAS: {daily_stats['wins']}\n❌ PERDIDAS: {daily_stats['losses']}\n\n📈 ACIERTOS = {accuracy:.2f}%"
-    asyncio.create_task(broadcast(msg))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ESTRATEGIA MODERADA (filtro exclusivo para alertas 2.00x)
-# ─────────────────────────────────────────────────────────────────────────────
-class ModerateStrategy:
-    @staticmethod
-    def compute_positions(values: List[float]) -> List[int]:
-        positions = [0]
-        for v in values[1:]:
-            delta = 1 if v >= WIN_TARGET else -1
-            positions.append(positions[-1] + delta)
-        return positions
-
-    @staticmethod
-    def compute_emas(positions: List[int], periods: List[int]) -> Dict[int, List[float]]:
-        emas = {}
-        for p in periods:
-            if len(positions) < p:
-                emas[p] = []
-                continue
-            k = 2.0 / (p + 1)
-            ema_vals = [positions[0]]
-            for i in range(1, len(positions)):
-                ema_vals.append(ema_vals[-1] + k * (positions[i] - ema_vals[-1]))
-            emas[p] = ema_vals
-        return emas
-
-    @classmethod
-    def check_alerts(cls, values: List[float]) -> Tuple[bool, Optional[float]]:
-        if len(values) < MODERATE_MIN_DATA:
-            return False, None
-
-        positions = cls.compute_positions(values)
-        emas = cls.compute_emas(positions, [4, 8, 20])
-
-        for p in [4, 8, 20]:
-            if len(emas.get(p, [])) < 2:
-                return False, None
-
-        last_pos      = positions[-1]
-        last_ema4     = emas[4][-1]
-        last_ema8     = emas[8][-1]
-        last_ema20    = emas[20][-1]
-        prev_ema8     = emas[8][-2]
-        prev_ema20    = emas[20][-2]
-
-        alert_200 = False
-
-        if prev_ema8 <= prev_ema20 and last_ema8 > last_ema20:
-            alert_200 = True
-
-        if not alert_200 and len(positions) >= 3:
-            a, b, c = positions[-3:]
-            if abs(a - c) <= 1 and b > a and last_pos > last_ema4 and last_pos > last_ema8 and last_pos > last_ema20:
-                alert_200 = True
-
-        if not alert_200 and len(values) >= 2 and values[-1] >= WIN_TARGET and values[-2] >= WIN_TARGET:
-            if last_ema4 > last_ema8 > last_ema20 and (len(values) < 3 or values[-3] < WIN_TARGET):
-                alert_200 = True
-
-        if alert_200:
-            return True, 2.00
-        return False, None
+    # Parámetros de señal
+    SIGNAL_MAX_BARS = 2          # Intentos (velas) para validar señal
+    EMA_FAST = 4
+    EMA_SLOW = 12
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ESTRATEGIA MAESTRO (original)
-# ─────────────────────────────────────────────────────────────────────────────
-class MaestroStrategy:
+class TrendAnalyzer:
+    """Analiza la tendencia basada en multiplicadores recientes."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.mults: List[Dict] = []   # cada uno: {'value': float, 'id': str, 'ts': float}
+        self.current_favorable: Optional[bool] = None
 
-    @staticmethod
-    def _ema(values: List[float], period: int) -> List[float]:
-        if not values:
+    def add_multiplier(self, value: float, round_id: str):
+        """Agrega un nuevo multiplicador y mantiene tamaño máximo."""
+        self.mults.append({'value': value, 'id': round_id, 'ts': time.time()})
+        if len(self.mults) > self.config.MAX_MULTS:
+            self.mults = self.mults[-self.config.TRIM_MULTS:]
+
+    def get_stats(self, n: int = 200) -> dict:
+        """Estadísticas de los últimos n multiplicadores usando umbrales configurables."""
+        data = self.mults[-n:] if len(self.mults) >= n else self.mults
+        total = len(data)
+        if total == 0:
+            return {
+                'total': 0, 'has_enough': False, 'favorable': None,
+                'count_100_199': 0, 'count_200_499': 0,
+                'count_500_999': 0, 'count_1000_plus': 0,
+                'pct_100_199': 0.0, 'pct_200_499': 0.0,
+            }
+
+        r1 = sum(1 for m in data if 1.00 <= m['value'] < 2.00)
+        r2 = sum(1 for m in data if 2.00 <= m['value'] < 5.00)
+        r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
+        r4 = sum(1 for m in data if m['value'] >= 10.00)
+
+        pct1 = r1 / total * 100
+        pct2 = r2 / total * 100
+
+        unfavorable = (pct1 > self.config.THRESHOLD_1_199_MAX) or (pct2 < self.config.THRESHOLD_2_499_MIN)
+        favorable = not unfavorable
+
+        return {
+            'total': total,
+            'has_enough': total >= n,
+            'favorable': favorable,
+            'count_100_199': r1,
+            'count_200_499': r2,
+            'count_500_999': r3,
+            'count_1000_plus': r4,
+            'pct_100_199': pct1,
+            'pct_200_499': pct2,
+        }
+
+    def update_trend(self) -> Optional[bool]:
+        """Evalúa si hubo cambio de tendencia y retorna el nuevo estado o None si sin cambio."""
+        stats = self.get_stats(200)
+        if stats['total'] < 10:
+            return None
+        new_fav = stats['favorable']
+        if new_fav != self.current_favorable:
+            self.current_favorable = new_fav
+            return new_fav
+        return None
+
+
+class SignalEngine:
+    """Motor de señales: acumulado, EMAs, condiciones y gestión de 2 intentos."""
+    
+    def __init__(self, config: Config, trend_analyzer: TrendAnalyzer):
+        self.config = config
+        self.trend = trend_analyzer
+        
+        # Datos para señales
+        self.positions: List[int] = []        # acumulado +1/-1
+        self.ema4: List[float] = []
+        self.ema12: List[float] = []
+        
+        # Señal pendiente
+        self.signal_pending = {
+            'active': False,
+            'created_index': -1,
+            'trigger_value': 0.0,
+            'observed_values': [],
+            'max_bars': config.SIGNAL_MAX_BARS
+        }
+        
+        # Marcador diario
+        self.daily_wins = 0
+        self.daily_losses = 0
+        self.last_reset_date = None
+
+    def argentina_now(self) -> datetime:
+        return datetime.utcnow() - timedelta(hours=3)
+
+    def reset_daily_if_needed(self):
+        today = self.argentina_now().date()
+        if self.last_reset_date is None:
+            self.last_reset_date = today
+            return
+        if today != self.last_reset_date:
+            self.daily_wins = 0
+            self.daily_losses = 0
+            self.last_reset_date = today
+            logger.info("📆 Marcador diario reiniciado")
+
+    def classify(self, value: float) -> int:
+        v = value
+        if 1.00 <= v <= 1.09: return -10
+        if 1.10 <= v <= 1.19: return -9
+        if 1.20 <= v <= 1.29: return -8
+        if 1.30 <= v <= 1.39: return -7
+        if 1.40 <= v <= 1.49: return -6
+        if 1.50 <= v <= 1.59: return -5
+        if 1.60 <= v <= 1.69: return -4
+        if 1.70 <= v <= 1.79: return -3
+        if 1.80 <= v <= 1.89: return -2
+        if 1.90 <= v <= 1.99: return -1
+        if 2.00 <= v <= 2.99: return 1
+        if 3.00 <= v <= 3.99: return 2
+        if 4.00 <= v <= 4.99: return 3
+        if 5.00 <= v <= 5.99: return 4
+        if 6.00 <= v <= 6.99: return 5
+        if 7.00 <= v <= 7.99: return 6
+        if 8.00 <= v <= 8.99: return 7
+        if 9.00 <= v <= 9.99: return 8
+        if 10.00 <= v <= 14.99: return 9
+        if 15.00 <= v <= 19.99: return 10
+        return 0
+
+    def update_position(self, value: float) -> int:
+        return 1 if value >= self.config.WIN_TARGET else -1
+
+    def calc_ema(self, data: List[int], period: int) -> List[float]:
+        if not data:
             return []
-        k = 2.0 / (period + 1)
-        ema = [values[0]]
-        for v in values[1:]:
-            ema.append(ema[-1] + k * (v - ema[-1]))
+        k = 2 / (period + 1)
+        ema = [float(data[0])]
+        for i in range(1, len(data)):
+            ema.append((data[i] - ema[i-1]) * k + ema[i-1])
         return ema
 
-    @classmethod
-    def get_ema_state(cls, results: List[Dict]) -> Dict[str, Any]:
-        if len(results) < 5:
-            return {
-                'ema3': None, 'ema5': None,
-                'prev_ema3': None, 'prev_ema5': None,
-                'bullish': None, 'crossover_up': False, 'crossover_down': False,
-                'price_above_ema3': None, 'ema_boost': 0.0, 'ema_label': '—',
-                'ready': False,
-            }
-        window = results[:min(20, len(results))]
-        vals = [r['value'] for r in reversed(window)]
-        ema3_series = cls._ema(vals, 3)
-        ema5_series = cls._ema(vals, 5)
-        ema3 = ema3_series[-1]
-        ema5 = ema5_series[-1]
-        prev_ema3 = ema3_series[-2] if len(ema3_series) >= 2 else ema3
-        prev_ema5 = ema5_series[-2] if len(ema5_series) >= 2 else ema5
-        last_price = vals[-1]
-        bullish = ema3 > ema5
-        crossover_up = (prev_ema3 <= prev_ema5) and (ema3 > ema5)
-        crossover_down = (prev_ema3 >= prev_ema5) and (ema3 < ema5)
-        price_above_ema3 = last_price > ema3
-        boost = 0.0
-        if crossover_up:
-            boost = +0.12
-        elif crossover_down:
-            boost = -0.15
-        elif bullish and price_above_ema3:
-            boost = +0.07
-        elif bullish:
-            boost = +0.04
-        elif not bullish and not price_above_ema3:
-            boost = -0.10
-        elif not bullish:
-            boost = -0.05
-        if crossover_up:
-            label = f'🟢 Cruce EMA3↑EMA5 ({ema3:.2f}/{ema5:.2f})'
-        elif crossover_down:
-            label = f'🔴 Cruce EMA3↓EMA5 ({ema3:.2f}/{ema5:.2f})'
-        elif bullish:
-            label = f'📗 EMA3 {ema3:.2f} > EMA5 {ema5:.2f}'
+    def check_continuation_signal(self) -> bool:
+        """Evalúa 5 condiciones; necesita al menos 3 verdaderas."""
+        if len(self.positions) < 12 or len(self.ema4) < 12 or len(self.ema12) < 12:
+            return False
+
+        conditions = []
+
+        # 1. EMA4 > EMA12 y pendiente positiva de EMA4
+        ema4_curr = self.ema4[-1]
+        ema4_prev = self.ema4[-2] if len(self.ema4) > 1 else ema4_curr
+        ema12_curr = self.ema12[-1]
+        conditions.append(ema4_curr > ema12_curr and (ema4_curr - ema4_prev) > 0)
+
+        # 2. Mayoría alcista en últimas 8 velas
+        last8 = self.positions[-8:] if len(self.positions) >= 8 else self.positions
+        bullish_count = sum(1 for p in last8 if p == 1)
+        conditions.append(bullish_count >= 5)
+
+        # 3. Fuerza mejorando (media últimas 4 > media previas 4)
+        if len(self.trend.mults) >= 8:
+            recent = [self.classify(m['value']) for m in self.trend.mults[-4:]]
+            prev = [self.classify(m['value']) for m in self.trend.mults[-8:-4]]
+            conditions.append(sum(recent)/4 > sum(prev)/4 - 0.1)
         else:
-            label = f'📕 EMA3 {ema3:.2f} < EMA5 {ema5:.2f}'
+            conditions.append(False)
+
+        # 4. Pendiente del acumulado positiva (último vs hace 5)
+        if len(self.positions) >= 5:
+            conditions.append(self.positions[-1] - self.positions[-5] > 0)
+        else:
+            conditions.append(False)
+
+        # 5. Última vela alcista y fuerza positiva
+        if len(self.positions) >= 2:
+            inc = self.positions[-1] - self.positions[-2]
+            last_force = self.classify(self.trend.mults[-1]['value']) if self.trend.mults else 0
+            conditions.append(inc > 0 and last_force > 0)
+        else:
+            conditions.append(False)
+
+        return sum(conditions) >= 3
+
+    def add_multiplier(self, value: float, round_id: str):
+        """Procesa un nuevo multiplicador: actualiza posición, EMAs y evalúa señal/resolución."""
+        # Actualizar posición
+        inc = self.update_position(value)
+        self.positions.append(inc if self.positions else inc)
+        self.trend.add_multiplier(value, round_id)
+
+        # Mantener tamaño
+        if len(self.positions) > self.config.MAX_MULTS:
+            self.positions = self.positions[-self.config.TRIM_MULTS:]
+
+        # Recalcular EMAs
+        self.ema4 = self.calc_ema(self.positions, self.config.EMA_FAST)
+        self.ema12 = self.calc_ema(self.positions, self.config.EMA_SLOW)
+
+        # Gestión de señal pendiente
+        if self.signal_pending['active']:
+            self.signal_pending['observed_values'].append(value)
+            observed_len = len(self.signal_pending['observed_values'])
+
+            # ¿Acierto?
+            if value >= self.config.WIN_TARGET:
+                self._resolve_signal(True)
+                return
+            # ¿Fallo por alcanzar máximo de velas?
+            if observed_len >= self.signal_pending['max_bars']:
+                self._resolve_signal(False)
+                return
+            # Seguir esperando
+            return
+
+        # No hay señal pendiente: evaluar nueva señal
+        if self.check_continuation_signal():
+            self.signal_pending = {
+                'active': True,
+                'created_index': len(self.positions) - 1,
+                'trigger_value': value,
+                'observed_values': [],
+                'max_bars': self.config.SIGNAL_MAX_BARS
+            }
+            # Devolver evento de señal (será manejado por el bot)
+            return {'type': 'signal', 'trigger': value}
+        return None
+
+    def _resolve_signal(self, is_win: bool):
+        """Resuelve la señal pendiente y devuelve evento de resolución."""
+        trigger = self.signal_pending['trigger_value']
+        observed = self.signal_pending['observed_values'][:]  # copia
+        self.signal_pending['active'] = False
+        self.signal_pending['observed_values'] = []
+        self.reset_daily_if_needed()
+        if is_win:
+            self.daily_wins += 1
+        else:
+            self.daily_losses += 1
+        return {'type': 'resolution', 'is_win': is_win, 'trigger': trigger, 'observed': observed}
+
+    def get_daily_stats(self):
+        self.reset_daily_if_needed()
+        total = self.daily_wins + self.daily_losses
+        win_rate = (self.daily_wins / total * 100) if total > 0 else 0.0
         return {
-            'ema3': ema3, 'ema5': ema5,
-            'prev_ema3': prev_ema3, 'prev_ema5': prev_ema5,
-            'bullish': bullish,
-            'crossover_up': crossover_up, 'crossover_down': crossover_down,
-            'price_above_ema3': price_above_ema3,
-            'ema_boost': boost,
-            'ema_label': label,
-            'ready': True,
+            'wins': self.daily_wins,
+            'losses': self.daily_losses,
+            'win_rate': win_rate,
+            'last_reset': str(self.last_reset_date) if self.last_reset_date else None
         }
 
-    @classmethod
-    def analyze_trend(cls, results: List[Dict]) -> Dict[str, Any]:
-        if len(results) < 3:
-            return {
-                'prediction': 'Cargando datos...',
-                'risk': 'wait',
-                'detail': 'Esperando resultados',
-                'confidence': 0.0,
-                'ema': {},
-            }
-        recent = results[:min(10, len(results))]
-        vals = [r['value'] for r in recent]
-        avg = sum(vals) / len(vals)
-        last3 = vals[:3]
-        last3avg = sum(last3) / len(last3)
-        green_ratio = sum(1 for v in vals if v >= WIN_TARGET) / len(vals)
-        last_is_green = vals[0] >= WIN_TARGET
-        second_last = vals[1] if len(vals) > 1 else vals[0]
-        streak = 0
-        for v in vals:
-            if v >= WIN_TARGET:
-                break
-            streak += 1
-        ema = cls.get_ema_state(results)
-        base_result = None
-        if streak >= 3 and last_is_green:
-            base_result = {
-                'prediction': '🎯 Zona de entrada detectada',
-                'risk': 'low',
-                'detail': f'{streak} rojas → verde. Posible racha.',
-                'confidence': min(0.85, 0.70 + (streak - 3) * 0.05),
-            }
-        elif second_last < WIN_TARGET and last_is_green:
-            base_result = {
-                'prediction': '📍 Posible zona de entrada',
-                'risk': 'low',
-                'detail': 'Rojo → verde. Reversión detectada.',
-                'confidence': 0.70,
-            }
-        elif last_is_green and last3avg > avg:
-            base_result = {
-                'prediction': '📈 Tendencia alcista activa',
-                'risk': 'low',
-                'detail': f'Últimas 3: {last3avg:.2f}x > Media: {avg:.2f}x',
-                'confidence': 0.65,
-            }
-        elif last_is_green and second_last >= WIN_TARGET:
-            base_result = {
-                'prediction': '⚡ Racha verde — Precaución',
-                'risk': 'medium',
-                'detail': f'Tasa verdes: {green_ratio*100:.0f}%',
-                'confidence': 0.45,
-            }
-        elif vals[0] >= 5.0:
-            base_result = {
-                'prediction': '🚀 ¡Multiplicador alto!',
-                'risk': 'medium',
-                'detail': f'{vals[0]:.2f}x registrado',
-                'confidence': 0.45,
-            }
-        elif streak >= 2:
-            risk = 'low' if streak >= 4 else 'medium'
-            conf = min(0.75, 0.55 + (streak - 2) * 0.07) if streak >= 4 else 0.50
-            base_result = {
-                'prediction': f'⏳ Racha roja ({streak})',
-                'risk': risk,
-                'detail': 'Zona de entrada próxima.' if streak >= 4 else 'Esperando señal.',
-                'confidence': conf,
-            }
-        elif last_is_green:
-            base_result = {
-                'prediction': '👀 Monitoreando...',
-                'risk': 'medium',
-                'detail': f'Último: {vals[0]:.2f}x | Avg: {avg:.2f}x',
-                'confidence': 0.40,
-            }
-        else:
-            base_result = {
-                'prediction': '⌛ Esperando señal...',
-                'risk': 'wait',
-                'detail': f'Verdes: {green_ratio*100:.0f}% | Avg: {avg:.2f}x',
-                'confidence': 0.0,
-            }
-        if ema['ready']:
-            conf_adj = max(0.0, min(0.95, base_result['confidence'] + ema['ema_boost']))
-            risk_adj = base_result['risk']
-            if ema['crossover_down'] and risk_adj == 'low':
-                risk_adj = 'medium'
-            if (ema['crossover_up'] and risk_adj == 'medium'
-                    and base_result['confidence'] >= 0.50 and conf_adj >= MAESTRO_MIN_CONFIDENCE):
-                risk_adj = 'low'
-            if not ema['bullish'] and not ema['price_above_ema3'] and risk_adj == 'low':
-                conf_adj = max(0.0, conf_adj - 0.05)
-            detail_with_ema = f"{base_result['detail']} | {ema['ema_label']}"
-            return {
-                'prediction': base_result['prediction'],
-                'risk': risk_adj,
-                'detail': detail_with_ema,
-                'confidence': conf_adj,
-                'ema': ema,
-            }
-        base_result['ema'] = ema
-        return base_result
 
-    @staticmethod
-    def calculate_support_resistance(results: List[Dict]) -> Dict[str, Optional[float]]:
-        values = [r['value'] for r in results]
-        if len(values) < 10:
-            return {'support': None, 'resistance': None}
-        window = max(3, len(values) // 8)
-        smoothed = []
-        for i in range(len(values)):
-            lo = max(0, i - 3)
-            hi = min(len(values) - 1, i + 3)
-            smoothed.append(sum(values[lo:hi+1]) / (hi - lo + 1))
-        support = resistance = None
-        for i in range(window, len(smoothed) - window):
-            is_min = all(smoothed[i] <= smoothed[j] for j in range(i - window, i + window + 1) if j != i)
-            is_max = all(smoothed[i] >= smoothed[j] for j in range(i - window, i + window + 1) if j != i)
-            if is_min and (support is None or smoothed[i] > support):
-                support = smoothed[i]
-            if is_max and (resistance is None or smoothed[i] < resistance):
-                resistance = smoothed[i]
-        return {'support': support, 'resistance': resistance}
+class TelegramBotHandler:
+    """Maneja la interacción con Telegram: comandos, broadcasts, mensajes HTML."""
+    
+    def __init__(self, config: Config, signal_engine: SignalEngine, trend_analyzer: TrendAnalyzer):
+        self.config = config
+        self.signal_engine = signal_engine
+        self.trend = trend_analyzer
+        self.bot = AsyncTeleBot(config.BOT_TOKEN)
+        self.registered_chats: Set[int] = set()
+        self._setup_handlers()
 
-    def should_enter(self, results: List[Dict]) -> Tuple[bool, float, str]:
-        if len(results) < 3:
-            return False, 0.0, "Datos insuficientes"
-        trend = self.analyze_trend(results)
-        conf = trend['confidence']
-        ema = trend.get('ema', {})
-        if ema.get('crossover_down', False):
-            logger.info("🚫 Señal bloqueada — cruce EMA bajista activo")
-            return False, conf, f"Bloqueado: cruce EMA bajista | {ema.get('ema_label','')}"
-        if trend['risk'] != 'low' or conf < MAESTRO_MIN_CONFIDENCE:
-            return False, conf, trend['detail']
-        values = [r['value'] for r in results[:50]]
-        alerta_200, target = ModerateStrategy.check_alerts(values)
-        if not alerta_200:
-            logger.info("🚫 Señal Maestro bloqueada: sin alerta moderada 2.00x")
-            return False, conf, f"{trend['detail']} (sin alerta moderada 2.00x)"
-        logger.info(f"✅ Señal Maestro CONFIRMADA por alerta moderada 2.00x")
-        return True, conf, trend['detail'] + " | Confirmación moderada 2.00x"
+    def _setup_handlers(self):
+        @self.bot.message_handler(commands=['start'])
+        async def start_cmd(message):
+            await self.cmd_start(message)
 
+        @self.bot.message_handler(commands=['estadisticas'])
+        async def stats_cmd(message):
+            await self.cmd_estadisticas(message)
 
-maestro_strategy = MaestroStrategy()
+        @self.bot.message_handler(commands=['tendencia'])
+        async def trend_cmd(message):
+            await self.cmd_tendencia(message)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SESIÓN GLOBAL — Gestión 3C × 2I
-# ─────────────────────────────────────────────────────────────────────────────
-class GlobalSession:
-    IDLE = 'idle'
-    EVALUATING = 'evaluating'
-    WAITING_SIGNAL = 'waiting_signal'
-    DONE = 'done'
+    async def cmd_start(self, message):
+        name = message.from_user.first_name or "usuario"
+        self.registered_chats.add(message.chat.id)
+        self.signal_engine.reset_daily_if_needed()
+        msg = (
+            f"🚀 <b>¡Bienvenido {name}!</b>\n\n"
+            "🤖 <b>Bot de Señales Spaceman</b>\n"
+            "🎯 Sistema de continuación alcista | 2 intentos\n"
+            "<b>📊 Umbrales de tendencia configurados:</b>\n"
+            f"   • 1.00-1.99x: ≤{self.config.THRESHOLD_1_199_MAX:.0f}%\n"
+            f"   • 2.00-4.99x: ≥{self.config.THRESHOLD_2_499_MIN:.0f}%\n"
+            "🔔 Recibirás señales en tiempo real.\n"
+            "📊 Usa /estadisticas o /tendencia para más información."
+        )
+        await self.bot.reply_to(message, msg, parse_mode='HTML')
 
-    def __init__(self, carry_fichas: list = None):
-        self.base_bet = BASE_BET
-        self.state = self.IDLE
-        self.scale = 1
-        self.col = 1
-        self.attempt = 1
-        self.lost = 0.0
-        self.cur_bet = BASE_BET
-        self.entries = 0
-        self.wins = 0
-        self.losses = 0
-        self.created = datetime.now()
-        self.signal_trigger_mult = 0.0
-        self.attempt1_result_value = 0.0
-        self.fichas: list = carry_fichas if carry_fichas is not None else []
-        self._cur_ficha: dict = None
-        self._col_attempt_bets: list = []
+    async def cmd_estadisticas(self, message):
+        self.registered_chats.add(message.chat.id)
+        stats = self.signal_engine.get_daily_stats()
+        marcador = (
+            f"<b>📊 MARCADOR DIARIO</b>\n"
+            f"✅ GANADAS: <code>{stats['wins']}</code>\n"
+            f"❌ PERDIDAS: <code>{stats['losses']}</code>\n"
+            f"📈 ACIERTOS = <code>{stats['win_rate']:.2f}%</code>\n"
+            f"🕒 Último reinicio: {stats['last_reset']}"
+        )
+        await self.bot.reply_to(message, marcador, parse_mode='HTML')
 
-    def start_ficha(self):
-        self._cur_ficha = {
-            'n': len(self.fichas) + 1,
-            'c1': 0.0, 'c2': 0.0, 'c3': 0.0,
-            'result': None,
-            'ts': argentina_time(),
-        }
+    async def cmd_tendencia(self, message):
+        self.registered_chats.add(message.chat.id)
+        stats = self.trend.get_stats(200)
+        if stats['total'] == 0:
+            await self.bot.reply_to(message, "⏳ Aún no hay suficientes datos (mínimo 200 multiplicadores).", parse_mode='HTML')
+            return
+        fav = stats['favorable']
+        estado = "🟢 FAVORABLE" if fav else "🔴 DESFAVORABLE"
+        if fav is None:
+            estado = "⚪ INDEFINIDA"
+        respuesta = (
+            f"<b>📡 TENDENCIA ACTUAL</b> (<code>{stats['total']}</code> últimos multiplicadores)\n"
+            f"{estado}\n\n"
+            f"🔵 1.00-1.99x: <code>{stats['pct_100_199']:.1f}%</code> (límite ≤{self.config.THRESHOLD_1_199_MAX:.0f}%)\n"
+            f"🟣 2.00-4.99x: <code>{stats['pct_200_499']:.1f}%</code> (mínimo ≥{self.config.THRESHOLD_2_499_MIN:.0f}%)\n"
+            f"🟡 5.00-9.99x: <code>{stats['pct_500_999']:.1f}%</code>\n"
+            f"🔴 +10.00x: <code>{stats['pct_1000_plus']:.1f}%</code>\n\n"
+            f"<b>Umbrales configurables:</b>\n• Para 1.00-1.99x: ≤{self.config.THRESHOLD_1_199_MAX:.0f}%\n• Para 2.00-4.99x: ≥{self.config.THRESHOLD_2_499_MIN:.0f}%"
+        )
+        await self.bot.reply_to(message, respuesta, parse_mode='HTML')
 
-    def on_result(self, win: bool) -> tuple:
-        self.entries += 1
-        prev_bet = self.cur_bet
-        prev_col = self.col
-        if self._cur_ficha is not None:
-            self._cur_ficha[f'c{prev_col}'] = self._cur_ficha.get(f'c{prev_col}', 0.0) + prev_bet
-        self._col_attempt_bets.append(prev_bet)
-        if win:
-            self.wins += 1
-            self.lost = 0.0
-            self.cur_bet = self.base_bet
-            self.col = 1
-            self.attempt = 1
-            self.scale += 1
-            self._col_attempt_bets = []
-            if self._cur_ficha is not None:
-                self._cur_ficha['result'] = 'win'
-                self.fichas.append(self._cur_ficha)
-                self._cur_ficha = None
-            if len(self.fichas) > 100:
-                self.fichas = self.fichas[-100:]
-            if self.scale > CYCLE_SIZE:
-                self.state = self.DONE
-                return ('cycle_win', prev_bet)
-            self.state = self.IDLE
-            return ('win', prev_bet)
-        else:
-            self.losses += 1
-            self.lost += prev_bet
-            self.cur_bet = self.lost + self.base_bet
-            self.attempt += 1
-            if self.attempt > MAX_ATTS:
-                self.attempt = 1
-                self.col += 1
-                if self.col > MAX_COLS:
-                    if self._cur_ficha is not None:
-                        self._cur_ficha['result'] = 'loss'
-                        self.fichas.append(self._cur_ficha)
-                        self._cur_ficha = None
-                    if len(self.fichas) > 100:
-                        self.fichas = self.fichas[-100:]
-                    self.state = self.DONE
-                    return ('cycle_loss', prev_bet)
-                else:
-                    self.state = self.IDLE
-                    return ('new_col', prev_bet)
-            else:
-                self.state = self.WAITING_SIGNAL
-                return ('wait_signal', prev_bet)
-
-    def status_short(self) -> str:
-        total_f = len(self.fichas)
-        wins_f = sum(1 for f in self.fichas if f['result'] == 'win')
-        pct = wins_f / total_f * 100 if total_f > 0 else 0.0
-        return f"📈 Ganadas/Perdidas: `{pct:.2f}%`"
-
-
-g_session = GlobalSession()
-
-def reset_global_session():
-    global g_session
-    old_fichas = list(g_session.fichas)
-    g_session = GlobalSession(carry_fichas=old_fichas)
-    logger.info("🔄 Sesión global reiniciada — fichas preservadas")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FUNCIONES AUXILIARES (con umbrales configurables)
-# ─────────────────────────────────────────────────────────────────────────────
-def argentina_time() -> str:
-    return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
-
-def get_quota_stats(n: int = 200) -> dict:
-    data = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
-    total = len(data)
-    if total == 0:
-        return {'total': 0, 'has_enough': False, 'favorable': None,
-                'count_100_199': 0, 'count_200_499': 0, 'count_500_999': 0, 'count_1000_plus': 0,
-                'pct_100_199': 0.0, 'pct_200_499': 0.0, 'pct_500_999': 0.0, 'pct_1000_plus': 0.0}
-    r1 = sum(1 for m in data if 1.00 <= m['value'] < 2.00)
-    r2 = sum(1 for m in data if 2.00 <= m['value'] < 5.00)
-    r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
-    r4 = sum(1 for m in data if m['value'] >= 10.00)
-    pct1, pct2, pct3, pct4 = r1/total*100, r2/total*100, r3/total*100, r4/total*100
-    # Uso de variables editables
-    unfavorable = pct1 > UMBRAL_PCT_ROJO_MAX or pct2 < UMBRAL_PCT_VERDE_MIN
-    return {
-        'total': total, 'has_enough': total >= 200, 'favorable': not unfavorable,
-        'count_100_199': r1, 'count_200_499': r2, 'count_500_999': r3, 'count_1000_plus': r4,
-        'pct_100_199': pct1, 'pct_200_499': pct2, 'pct_500_999': pct3, 'pct_1000_plus': pct4,
-    }
-
-def quota_stats_text(stats: dict) -> str:
-    if stats['total'] == 0:
-        return "📡 _Sin datos suficientes para analizar cuotas._\n"
-    n_label = "200" if stats['has_enough'] else f"{stats['total']} (acumulando...)"
-    r1_flag = " ✅" if stats['pct_100_199'] <= UMBRAL_PCT_ROJO_MAX else " ❌"
-    r2_flag = " ✅" if stats['pct_200_499'] >= UMBRAL_PCT_VERDE_MIN else " ❌"
-    fav_line = "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_" if stats['favorable'] else "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
-    return (f"📈 *Análisis de la Tendencia últimos*\n"
-            f"      *{n_label} multiplicadores*\n"
-            f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
-            f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
-            f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
-            f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
-            " \n" + fav_line + "\n")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BROADCAST Y MENSAJERÍA
-# ─────────────────────────────────────────────────────────────────────────────
-async def broadcast(msg: str, parse_mode: str = None) -> dict:
-    try:
-        m = await bot.send_message(CHANNEL_ID, msg, parse_mode=parse_mode)
-        return {CHANNEL_ID: m.message_id}
-    except Exception as e:
-        logger.warning(f"Error enviando al canal {CHANNEL_ID}: {e}")
-        return {}
-
-async def broadcast_trend_change(favorable: bool):
-    global g_last_trend_msg_id
-    hora = argentina_time()
-    stats = get_quota_stats(200)
-    trend = quota_stats_text(stats)
-    header = f"🟢 *TENDENCIA FAVORABLE — {hora}*\n" if favorable else f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
-    msg = header + "━━━━━━━━━━━━━━━━━━━━━━━\n" + trend
-    if g_last_trend_msg_id is not None:
-        try:
-            await bot.delete_message(CHANNEL_ID, g_last_trend_msg_id)
-        except Exception:
-            pass
-    result = await broadcast(msg, parse_mode='Markdown')
-    if CHANNEL_ID in result:
-        g_last_trend_msg_id = result[CHANNEL_ID]
-
-async def _send_signal(trigger: float, reason: str, is_second_opportunity: bool = False):
-    global g_signal_msg_ids
-    if is_second_opportunity:
-        for chat_id, msg_id in list(g_signal_msg_ids.items()):
+    async def broadcast(self, msg: str):
+        """Envía mensaje a todos los chats registrados y al canal fijo."""
+        dead = set()
+        for chat_id in list(self.registered_chats):
             try:
-                await bot.delete_message(chat_id, msg_id)
-            except Exception:
-                pass
-        g_signal_msg_ids = {}
-        title = "💎 Segunda Oportunidad —"
-        intento = f"2/{MAX_ATTS}"
-    else:
-        title = "💎 Señal para"
-        intento = f"1/{MAX_ATTS}"
-    txt = (f"🚨 Entrar después de: `{trigger:.2f}x`\n"
-           f"{title} `{WIN_TARGET:.2f}x`\n"
-           f"🇺🇲 Apuesta USD: `${g_session.cur_bet:.2f}`\n"
-           f"🆔 Gestión C{g_session.col} — Intento {intento}\n"
-           f"🧠 {reason}")
-    g_signal_msg_ids = await broadcast(txt, parse_mode='Markdown')
-
-async def _dispatch_result(value: float, tipo: str, bet: float):
-    global g_session
-    if tipo == 'win':
-        await broadcast(f"✅ WIN  GALE #{1 if g_session.attempt==1 else 2} ({value:.2f}x) 🇺🇲 ${BASE_BET:.2f}")
-        update_daily_stats(True)
-    elif tipo == 'cycle_win':
-        await broadcast(f"✅ WIN  GALE #{1 if g_session.attempt==1 else 2} ({value:.2f}x) 🇺🇲 ${BASE_BET:.2f}")
-        update_daily_stats(True)
-        await broadcast("━━━━━━━━━━━━━━━━━━━━━━━\n🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
-                        f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n🔄 _Sesión reiniciada_",
-                        parse_mode='Markdown')
-        reset_global_session()
-        await _check_trend_after_cycle()
-    elif tipo == 'new_col':
-        r1 = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
-        lost_col = g_session.col - 1
-        col_total = sum(g_session._col_attempt_bets) if g_session._col_attempt_bets else bet
-        g_session._col_attempt_bets = []
-        g_session.attempt1_result_value = 0.0
-        await broadcast(f"❌ LOSS C{lost_col} ({r1} | {value:.2f}x) 🇺🇲 $-{col_total:.2f}")
-    elif tipo == 'cycle_loss':
-        r1 = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
-        col_total = sum(g_session._col_attempt_bets) if g_session._col_attempt_bets else bet
-        g_session._col_attempt_bets = []
-        g_session.attempt1_result_value = 0.0
-        await broadcast(f"❌ LOSS C{MAX_COLS} ({r1} | {value:.2f}x) 🇺🇲 $-{col_total:.2f}")
-        update_daily_stats(False)
-        await broadcast("━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
-                        f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n🔄 _Sesión reiniciada_",
-                        parse_mode='Markdown')
-        reset_global_session()
-        await _check_trend_after_cycle()
-    elif tipo == 'wait_signal':
-        logger.info("Esperando nueva señal Maestro para segunda oportunidad")
-
-async def _check_trend_after_cycle():
-    stats = get_quota_stats(200)
-    if stats['total'] > 0 and not stats['favorable']:
-        hora = argentina_time()
-        trend = quota_stats_text(stats)
-        await broadcast(f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"{trend}"
-                        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "⏳ _El bot esperará hasta que la tendencia mejore._\n"
-                        "_Se notificará automáticamente cuando sea favorable._",
-                        parse_mode='Markdown')
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PROCESAMIENTO DE MULTIPLICADORES
-# ─────────────────────────────────────────────────────────────────────────────
-async def process_multiplier(value: float, round_id: str):
-    global g_signal_state, g_signal_trigger_mult, g_mults, g_seen_ids
-    global g_trend_favorable, g_session, g_maestro_results
-
-    logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state} | Sesión: {g_session.state}")
-
-    if g_signal_state == 'evaluating':
-        win = value >= WIN_TARGET
-        if g_session.state == GlobalSession.EVALUATING:
-            tipo, bet = g_session.on_result(win)
-            await _dispatch_result(value, tipo, bet)
-            if tipo in ('new_col', 'cycle_loss', 'cycle_win', 'win'):
-                g_signal_state = 'idle'
-        else:
-            g_signal_state = 'idle'
-
-    g_mults.append({'id': round_id, 'value': value, 'ts': time.time()})
-    g_maestro_results.insert(0, {'id': round_id, 'value': value, 'win': value >= WIN_TARGET})
-    if len(g_maestro_results) > MAESTRO_HISTORY_SIZE:
-        g_maestro_results.pop()
-    if len(g_mults) >= MAX_MULTS:
-        g_mults[:] = g_mults[-TRIM_MULTS:]
-    if len(g_seen_ids) > 2000:
-        g_seen_ids.clear()
-
-    stats_trend = get_quota_stats(200)
-    if stats_trend['total'] >= 10:
-        new_fav = stats_trend['favorable']
-        if new_fav != g_trend_favorable:
-            g_trend_favorable = new_fav
-            asyncio.create_task(broadcast_trend_change(new_fav))
-
-    if g_signal_state == 'idle':
-        should_enter, confidence, reason = maestro_strategy.should_enter(g_maestro_results)
-        if should_enter:
-            if g_session.col == 1 and g_session.state == GlobalSession.IDLE:
-                stats_now = get_quota_stats(200)
-                if stats_now['total'] > 0 and stats_now['favorable'] is False:
-                    logger.info("Señal Maestro bloqueada — tendencia desfavorable")
-                    return
-            if g_session.state == GlobalSession.IDLE:
-                g_signal_state = 'evaluating'
-                g_signal_trigger_mult = value
-                g_session.state = GlobalSession.EVALUATING
-                g_session.signal_trigger_mult = value
-                if g_session.col == 1:
-                    g_session.start_ficha()
-                await _send_signal(value, reason, is_second_opportunity=False)
-                logger.info(f"🚀 1ª SEÑAL | {value:.2f}x | conf {confidence:.2%} | {reason}")
-            elif g_session.state == GlobalSession.WAITING_SIGNAL and g_session.attempt == 2:
-                g_signal_state = 'evaluating'
-                g_signal_trigger_mult = value
-                g_session.state = GlobalSession.EVALUATING
-                g_session.signal_trigger_mult = value
-                await _send_signal(value, reason, is_second_opportunity=True)
-                logger.info(f"🔄 2ª SEÑAL | {value:.2f}x | apuesta ${g_session.cur_bet:.2f} | {reason}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# POLLER HTTP
-# ─────────────────────────────────────────────────────────────────────────────
-async def http_poller():
-    consecutive_errors = 0
-    sleep_next = POLL_INTERVAL_OK
-    logger.info(f"📡 Iniciando poller HTTP → {API_CRASH}")
-    async with aiohttp.ClientSession() as session:
-        while True:
-            await asyncio.sleep(sleep_next)
-            try:
-                ua = random.choice(USER_AGENTS)
-                headers = {'User-Agent': ua, 'Accept': 'application/json', 'Cache-Control': 'no-cache'}
-                g_poller_status['total_requests'] += 1
-                g_poller_status['last_poll_ts'] = time.time()
-                async with session.get(API_CRASH, headers=headers, timeout=aiohttp.ClientTimeout(total=10), ssl=True) as resp:
-                    if resp.status == 429:
-                        retry_after = int(resp.headers.get('Retry-After', 30))
-                        consecutive_errors += 1
-                        sleep_next = min(POLL_MAX_SLEEP, retry_after + random.uniform(1, 5))
-                        continue
-                    if resp.status >= 500:
-                        consecutive_errors += 1
-                        backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
-                        sleep_next = backoff
-                        continue
-                    if resp.status != 200:
-                        consecutive_errors += 1
-                        sleep_next = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
-                        continue
-                    try:
-                        data = await resp.json(content_type=None)
-                    except (json.JSONDecodeError, aiohttp.ContentTypeError):
-                        consecutive_errors += 1
-                        sleep_next = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
-                        continue
-                    api_id = data.get('id')
-                    max_mult = data.get('data', {}).get('result', {}).get('maxMultiplier')
-                    if not api_id or max_mult is None or max_mult <= 0:
-                        consecutive_errors = 0
-                        sleep_next = POLL_INTERVAL_OK + random.uniform(0.5, 1.5)
-                        continue
-                    round_id = str(api_id)
-                    if round_id in g_seen_ids:
-                        consecutive_errors = 0
-                        sleep_next = POLL_INTERVAL_OK + random.uniform(0.5, 1.5)
-                        continue
-                    g_seen_ids.add(round_id)
-                    g_poller_status['total_new_rounds'] += 1
-                    g_poller_status['last_round_ts'] = time.time()
-                    consecutive_errors = 0
-                    sleep_next = POLL_INTERVAL_OK + random.uniform(0.3, 1.0)
-                    logger.info(f"🎰 NUEVO GIRO #{g_poller_status['total_new_rounds']} | {round_id} | {max_mult:.2f}x")
-                    await process_multiplier(float(max_mult), round_id)
+                await self.bot.send_message(chat_id, msg, parse_mode='HTML')
             except Exception as e:
-                consecutive_errors += 1
-                backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
-                sleep_next = backoff
-                logger.exception(f"💥 Error inesperado: {e} → backoff {backoff:.1f}s")
-            finally:
-                g_poller_status['consecutive_errors'] = consecutive_errors
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD WEB (sencillo)
-# ─────────────────────────────────────────────────────────────────────────────
-flask_app = Flask(__name__)
-
-MAESTRO_HTML = """<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><title>Maestro Crash</title></head>
-<body><h1>Maestro Crash activo</h1><p>API funcionando</p></body>
-</html>"""
-
-@flask_app.route('/')
-def home():
-    return "Bot activo", 200
-
-@flask_app.route('/ping')
-def ping():
-    return "pong", 200
-
-@flask_app.route('/api/maestro_data')
-def api_maestro_data():
-    results = g_maestro_results[:50]
-    values = [r['value'] for r in results]
-    avg = sum(values) / len(values) if values else 0.0
-    max_val = max(values) if values else 0.0
-    green_pct = sum(1 for v in values if v >= WIN_TARGET) / len(values) * 100 if values else 0.0
-    trend = maestro_strategy.analyze_trend(results)
-    sr = maestro_strategy.calculate_support_resistance(results)
-    reset_daily_if_needed()
-    return jsonify({
-        'results': [{'id': r['id'], 'value': r['value'], 'win': r['win']} for r in results],
-        'prediction': trend['prediction'],
-        'detail': trend['detail'],
-        'risk': trend['risk'],
-        'confidence': trend['confidence'],
-        'support': sr['support'],
-        'resistance': sr['resistance'],
-        'avg': avg,
-        'max': max_val,
-        'green_pct': round(green_pct, 1),
-        'daily_wins': daily_stats['wins'],
-        'daily_losses': daily_stats['losses'],
-        'signal_active': g_signal_state == 'evaluating',
-        'signal_trigger': g_signal_trigger_mult,
-        'signal_col': g_session.col,
-        'signal_attempt': g_session.attempt,
-        'signal_bet': g_session.cur_bet,
-        'max_attempts': MAX_ATTS,
-        'total_rounds': g_poller_status['total_new_rounds'],
-        'data_count': len(g_mults),
-    })
-
-def run_flask():
-    port = int(os.environ.get('PORT', 8080))
-    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
-async def self_ping_loop():
-    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
-    if not render_url:
-        return
-    url = f"{render_url.rstrip('/')}/ping"
-    while True:
-        await asyncio.sleep(14 * 60)
+                err = str(e).lower()
+                if any(x in err for x in ('blocked', 'not found', 'deactivated', 'kicked')):
+                    dead.add(chat_id)
+                    logger.warning(f"Chat {chat_id} inactivo → removido")
+                else:
+                    logger.warning(f"Error en broadcast a {chat_id}: {e}")
+        self.registered_chats.difference_update(dead)
+        # Canal fijo
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)):
-                    pass
-        except Exception:
-            pass
+            await self.bot.send_message(self.config.CHANNEL_ID, msg, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"No se pudo enviar al canal {self.config.CHANNEL_ID}: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HANDLERS TELEGRAM (comandos sin acentos)
-# ─────────────────────────────────────────────────────────────────────────────
-@bot.message_handler(commands=['start'])
-async def cmd_start(message):
-    name = message.from_user.first_name or "usuario"
-    stats = get_quota_stats(200)
-    stats_blk = quota_stats_text(stats)
-    data_info = f"📡 `{len(g_mults)}/400` multiplicadores recopilados" if g_mults else "📡 Recopilando datos..."
-    await bot.reply_to(message,
-        f"🚀 *¡Bienvenido {name}!*\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎭 *Bot de Señales Crash — Estrategia Maestro + Filtro Moderado (solo 2.00x)*\n"
-        "📊 Análisis de rachas + EMAs | Detección de zonas de entrada\n"
-        f"🎯 Objetivo: `{WIN_TARGET:.2f}x` | Gestión: 3C×2I\n"
-        f"💰 Apuesta base: `${BASE_BET:.2f}`\n"
-        f"🧠 Confianza mínima: `{MAESTRO_MIN_CONFIDENCE*100:.0f}%` | Señales solo cuando Maestro da 'low' y Moderado detecta 2.00x\n"
-        f"📊 Umbrales tendencia: rojo > {UMBRAL_PCT_ROJO_MAX:.1f}% o verde < {UMBRAL_PCT_VERDE_MIN:.1f}% → desfavorable\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📢 *Señales en el canal oficial*\n"
-        "🤖 *Comandos:* /senal /estadisticas /tendencia\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{data_info}\n\n{stats_blk}",
-        parse_mode='Markdown')
+    async def send_signal_message(self, trigger: float):
+        msg = (
+            f"🚨 <b>Entrar después de:</b> <code>{trigger:.2f}x</code>\n"
+            f"💎 <b>Señal para 2.00x</b>\n"
+            f"🆔 <b>Gestión C3 — Intento 1/2</b>"
+        )
+        await self.broadcast(msg)
 
-@bot.message_handler(commands=['senal'])
-async def cmd_signal(message):
-    if not g_maestro_results:
-        await bot.reply_to(message, "📡 *Maestro*: Aún no hay suficientes datos.", parse_mode='Markdown')
-        return
-    trend = maestro_strategy.analyze_trend(g_maestro_results)
-    should, conf, reason = maestro_strategy.should_enter(g_maestro_results)
-    sr = maestro_strategy.calculate_support_resistance(g_maestro_results)
-    status_text = "✅ SEÑAL ACTIVA (Maestro low + Moderado 2.00x)" if should else "❌ Sin señal ahora"
-    support_txt = f"🟢 Soporte: `{sr['support']:.2f}x`" if sr['support'] else "🟢 Soporte: `—`"
-    resist_txt = f"🔴 Resistencia: `{sr['resistance']:.2f}x`" if sr['resistance'] else "🔴 Resistencia: `—`"
-    await bot.reply_to(message,
-        f"🎭 *Estrategia Maestro + Filtro Moderado 2.00x* (objetivo ≥ {WIN_TARGET:.2f}x)\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Predicción: `{trend['prediction']}`\n"
-        f"📝 Detalle: {trend['detail']}\n"
-        f"🎯 Confianza: `{conf*100:.1f}%`\n"
-        f"🚦 Estado: {status_text}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{support_txt}\n{resist_txt}",
-        parse_mode='Markdown')
+    async def send_resolution_message(self, is_win: bool, trigger: float, observed: List[float]):
+        if is_win:
+            winning_value = observed[-1]
+            attempt_index = len(observed) - 1
+            result_line = f"✅ WIN GALE #{attempt_index} — {winning_value:.2f}x"
+        else:
+            if len(observed) >= 2:
+                result_line = f"❌ LOSS {observed[0]:.2f}x — {observed[1]:.2f}x"
+            else:
+                result_line = f"❌ LOSS {observed[0]:.2f}x"
+        stats = self.signal_engine.get_daily_stats()
+        marcador = (
+            f"<b>📊 MARCADOR DIARIO:</b>\n"
+            f"✅ GANADAS: <code>{stats['wins']}</code>\n"
+            f"❌ PERDIDAS: <code>{stats['losses']}</code>\n"
+            f"📈 ACIERTOS = <code>{stats['win_rate']:.2f}%</code>"
+        )
+        full_msg = f"{result_line}\n\n{marcador}"
+        await self.broadcast(full_msg)
 
-@bot.message_handler(commands=['estadisticas'])
-async def cmd_estadisticas(message):
-    s = g_session
-    stats = get_quota_stats(200)
-    trend = quota_stats_text(stats)
-    gp_line = s.status_short()
-    fichas_rec = s.fichas[-15:]
-    if fichas_rec:
-        lineas = []
-        for f in fichas_rec:
-            total = f['c1'] + f['c2'] + f['c3']
-            net = BASE_BET if f['result'] == 'win' else -total
-            res = "✅" if f['result'] == 'win' else "❌"
-            cols = f"C1:${f['c1']:.2f}" + (f" C2:${f['c2']:.2f}" if f['c2'] > 0 else "") + (f" C3:${f['c3']:.2f}" if f['c3'] > 0 else "")
-            neto = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
-            lineas.append(f"{res} #{f['n']} {f.get('ts','--:--')} | {cols} | {neto}")
-        fichas_txt = "\n".join(lineas)
-        total_f = len(s.fichas)
-        wins_f = sum(1 for f in s.fichas if f['result'] == 'win')
-        resumen = f"Total fichas: `{total_f}` | ✅ `{wins_f}` | ❌ `{total_f-wins_f}`"
-    else:
-        fichas_txt = "_Sin fichas registradas aún._"
-        resumen = "Total fichas: `0` | ✅ `0` | ❌ `0`"
-    await bot.reply_to(message,
-        "📊 *ESTADÍSTICAS DEL BOT*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{gp_line}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Últimas fichas:*\n{fichas_txt}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{resumen}\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{trend}",
-        parse_mode='Markdown')
+    async def send_trend_change(self, favorable: bool):
+        hora = (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
+        if favorable:
+            msg = f"🟢 <b>TENDENCIA FAVORABLE</b> {hora}\nUmbrales: ≤{self.config.THRESHOLD_1_199_MAX:.0f}% para 1.00-1.99x | ≥{self.config.THRESHOLD_2_499_MIN:.0f}% para 2.00-4.99x"
+        else:
+            msg = f"🔴 <b>TENDENCIA DESFAVORABLE</b> {hora}\nUmbrales: ≤{self.config.THRESHOLD_1_199_MAX:.0f}% para 1.00-1.99x | ≥{self.config.THRESHOLD_2_499_MIN:.0f}% para 2.00-4.99x"
+        await self.broadcast(msg)
 
-@bot.message_handler(commands=['tendencia'])
-async def cmd_tendencia(message):
-    stats = get_quota_stats(200)
-    await bot.reply_to(message, quota_stats_text(stats), parse_mode='Markdown')
+    async def set_commands(self):
+        await self.bot.set_my_commands([
+            types.BotCommand('start', '🚀 Iniciar / recibir señales'),
+            types.BotCommand('estadisticas', '📊 Ver marcador diario'),
+            types.BotCommand('tendencia', '📈 Ver estado de la tendencia'),
+        ])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-async def main_async():
-    logger.info(f"🎭 Iniciando CrashBot Maestro + Filtro Moderado (solo 2.00x)")
-    logger.info(f"📊 Umbrales de tendencia: rojo > {UMBRAL_PCT_ROJO_MAX}%  |  verde < {UMBRAL_PCT_VERDE_MIN}%")
-    reset_daily_if_needed()
-    await bot.set_my_commands([
-        types.BotCommand('start', '🚀 Iniciar'),
-        types.BotCommand('senal', '🎯 Última predicción Maestro'),
-        types.BotCommand('estadisticas', '📊 Estadísticas y fichas'),
-        types.BotCommand('tendencia', '📈 Tendencia de cuotas'),
-    ])
-    asyncio.create_task(http_poller())
-    asyncio.create_task(self_ping_loop())
-    logger.info("✅ Tareas iniciadas — polling Telegram...")
-    await bot.infinity_polling(skip_pending=True)
+    async def infinity_polling(self):
+        await self.bot.infinity_polling(skip_pending=True)
+
+
+class WebSocketCollector:
+    """Se conecta al WebSocket, recibe multiplicadores y los envía al motor de señales."""
+    
+    def __init__(self, config: Config, signal_engine: SignalEngine, bot_handler: TelegramBotHandler):
+        self.config = config
+        self.signal_engine = signal_engine
+        self.bot = bot_handler
+        self.seen_ids: Set[str] = set()
+        self.last_value: Optional[float] = None
+
+    async def run(self):
+        while True:
+            try:
+                logger.info("🔌 Conectando al WebSocket de Spaceman...")
+                async with websockets.connect(
+                    self.config.WS_URL,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=10
+                ) as ws:
+                    subscribe_msg = {
+                        "type": "subscribe",
+                        "casinoId": self.config.CASINO_ID,
+                        "currency": self.config.CURRENCY,
+                        "key": [self.config.GAME_ID]
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    logger.info("✅ Suscrito a Spaceman")
+
+                    async for raw_msg in ws:
+                        try:
+                            data = json.loads(raw_msg)
+                            game_results = data.get('gameResult', [])
+                            if not game_results:
+                                continue
+                            first = game_results[0]
+                            value = float(first.get('result', 0))
+                            if value <= 0:
+                                continue
+
+                            round_id = str(
+                                first.get('roundId') or
+                                first.get('gameRoundId') or
+                                first.get('id') or
+                                f"{value}_{int(time.time()*1000)}"
+                            )
+
+                            if round_id in self.seen_ids:
+                                continue
+                            if value == self.last_value:
+                                continue
+
+                            self.seen_ids.add(round_id)
+                            self.last_value = value
+
+                            # Procesar el multiplicador
+                            event = self.signal_engine.add_multiplier(value, round_id)
+                            if event:
+                                if event['type'] == 'signal':
+                                    await self.bot.send_signal_message(event['trigger'])
+                                elif event['type'] == 'resolution':
+                                    await self.bot.send_resolution_message(
+                                        event['is_win'], event['trigger'], event['observed']
+                                    )
+
+                            # Limpiar IDs viejos
+                            if len(self.seen_ids) > 2000:
+                                oldest = sorted(self.seen_ids)[:1000]
+                                for oid in oldest:
+                                    self.seen_ids.discard(oid)
+
+                            # Verificar cambio de tendencia periódicamente
+                            if len(self.signal_engine.trend.mults) % 10 == 0:
+                                new_trend = self.signal_engine.trend.update_trend()
+                                if new_trend is not None:
+                                    await self.bot.send_trend_change(new_trend)
+
+                        except (json.JSONDecodeError, KeyError, ValueError) as e:
+                            logger.debug(f"Mensaje ignorado: {e}")
+                        except Exception as e:
+                            logger.error(f"Error procesando mensaje WS: {e}")
+
+            except websockets.ConnectionClosed as e:
+                logger.warning(f"WebSocket cerrado ({e.code}): {e.reason}")
+            except Exception as e:
+                logger.error(f"Error de WebSocket: {e}")
+
+            logger.info("🔄 Reconectando en 5 segundos...")
+            await asyncio.sleep(5)
+
+
+class SpacemanBot:
+    """Clase principal que orquesta todos los componentes."""
+    
+    def __init__(self):
+        self.config = Config()
+        self.trend_analyzer = TrendAnalyzer(self.config)
+        self.signal_engine = SignalEngine(self.config, self.trend_analyzer)
+        self.bot_handler = TelegramBotHandler(self.config, self.signal_engine, self.trend_analyzer)
+        self.ws_collector = WebSocketCollector(self.config, self.signal_engine, self.bot_handler)
+        self.flask_app = Flask(__name__)
+        self._setup_flask()
+
+    def _setup_flask(self):
+        @self.flask_app.route('/')
+        def home():
+            return (
+                f"🤖 SpacemanBot | Velas: {len(self.trend_analyzer.mults)} | "
+                f"Señal pendiente: {self.signal_engine.signal_pending['active']} | "
+                f"Chats: {len(self.bot_handler.registered_chats)} | "
+                f"Marcador: {self.signal_engine.daily_wins}/{self.signal_engine.daily_losses}"
+            ), 200
+
+        @self.flask_app.route('/ping')
+        def ping():
+            return "pong", 200
+
+        @self.flask_app.route('/stats')
+        def stats():
+            return {
+                "status": "ok",
+                "mults_collected": len(self.trend_analyzer.mults),
+                "signal_pending": self.signal_engine.signal_pending['active'],
+                "daily_wins": self.signal_engine.daily_wins,
+                "daily_losses": self.signal_engine.daily_losses,
+                "registered_chats": len(self.bot_handler.registered_chats),
+                "last_reset": str(self.signal_engine.last_reset_date) if self.signal_engine.last_reset_date else None,
+                "trend_favorable": self.trend_analyzer.current_favorable,
+                "thresholds": {
+                    "1.00-1.99_max": self.config.THRESHOLD_1_199_MAX,
+                    "2.00-4.99_min": self.config.THRESHOLD_2_499_MIN
+                }
+            }
+
+    def run_flask(self):
+        port = int(os.environ.get('PORT', 8080))
+        self.flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+    async def self_ping_loop(self):
+        render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+        if not render_url:
+            logger.info("RENDER_EXTERNAL_URL no configurada — self-ping desactivado")
+            return
+        url = f"{render_url.rstrip('/')}/ping"
+        while True:
+            await asyncio.sleep(14 * 60)
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        logger.info(f"Self-ping OK: {r.status}")
+            except Exception as e:
+                logger.warning(f"Self-ping falló: {e}")
+
+    async def run(self):
+        logger.info("🤖 Iniciando SpacemanBot (Orientado a Objetos, HTML)")
+        logger.info(f"📊 Umbrales: 1.00-1.99x ≤{self.config.THRESHOLD_1_199_MAX}% | 2.00-4.99x ≥{self.config.THRESHOLD_2_499_MIN}%")
+        await self.bot_handler.set_commands()
+        # Iniciar tareas asíncronas
+        asyncio.create_task(self.ws_collector.run())
+        asyncio.create_task(self.self_ping_loop())
+        # Iniciar Flask en hilo separado
+        flask_thread = threading.Thread(target=self.run_flask, daemon=True)
+        flask_thread.start()
+        logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
+        # Iniciar polling de Telegram
+        await self.bot_handler.infinity_polling()
+
 
 if __name__ == '__main__':
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    asyncio.run(main_async())
+    bot = SpacemanBot()
+    asyncio.run(bot.run())
