@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   CRASH BOT IA v4.0 — Estrategias Duales (Stake Crash + Maestro)            ║
-║   Motor Bayesiano + Cadena de Markov + Detección Patrones + Estrategia      ║
-║   Maestro (rachas, soporte/resistencia, ratio verdes)                       ║
-║   API HTTPS Polling | Dashboard Web | Telegram                              ║
+║   CRASH BOT — Estrategia Maestro Unificada (Galaxsys / Stake Crash)         ║
+║   + FILTRO MODERADO (gráfico moderado del HTML) para mejorar señales        ║
+║   Lógica analyzeTrend idéntica al HTML · Solo señales risk='low' ≥2.00x     ║
+║   Gestión 3C×2I · Marcador diario · Dashboard visual completo               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-
-Características principales:
-  - Mantiene toda la funcionalidad original (EMAs, ML, gestión de columnas)
-  - Añade la estrategia predictiva del juego Maestro (Galaxsys)
-  - Genera señales combinadas (OR/AND) con confianza propia
-  - Dashboard web /maestro con gráficos y estadísticas en tiempo real
-  - Comandos de Telegram: /start, /estadisticas, /ia, /mercado, /maestro
 """
 
 import asyncio
 import threading
 import json
 import logging
-import math
 import os
 import random
-import statistics
-import sys
 import time
-from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -39,392 +28,415 @@ from telebot import types
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout)]
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
-API_CRASH   = "https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest"
-CHANNEL_ID  = int(os.environ.get("CHANNEL_ID", "-1003613599867"))
+BOT_TOKEN  = os.environ.get("BOT_TOKEN",  "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo")
+API_CRASH  = "https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest"
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003613599867"))
 
-WIN_TARGET    = 2.00
-MAX_MULTS     = 400
-TRIM_MULTS    = 200
-MAX_COLS      = 3
-MAX_ATTS      = 2
-CYCLE_SIZE    = 10
-BASE_BET      = 0.10
+WIN_TARGET  = 2.00          # Umbral verde — igual que el HTML (>= 2.0)
+MAX_MULTS   = 400
+TRIM_MULTS  = 200
+MAX_COLS    = 3
+MAX_ATTS    = 2
+CYCLE_SIZE  = 10
+BASE_BET    = 0.10
 
-# ── PARÁMETROS IA ORIGINAL ────────────────────────────────────────────────────
-MIN_CONFIDENCE    = 0.58   # confianza mínima para emitir señal (ML)
-MARKOV_MIN_OBS    = 5
-ML_HISTORY_SIZE   = 500
+# ── PARÁMETROS MAESTRO ────────────────────────────────────────────────────────
+MAESTRO_MIN_CONFIDENCE = 0.55   # Confianza mínima para disparar señal
+MAESTRO_HISTORY_SIZE   = 100
 
-# ── PARÁMETROS ESTRATEGIA MAESTRO ─────────────────────────────────────────────
-MAESTRO_MIN_CONFIDENCE = 0.55      # confianza mínima desde Maestro
-MAESTRO_HISTORY_SIZE   = 100       # resultados guardados para análisis
-USE_MAESTRO_STRATEGY   = True      # activar/desactivar estrategia Maestro
-SIGNAL_COMBINE_MODE    = "OR"      # "OR" = cualquiera, "AND" = ambas deben coincidir
+# ── PARÁMETROS MODERADO (filtro adicional) ─────────────────────────────────────
+MODERATE_MIN_DATA = 20          # datos mínimos para analizar alerta moderada
 
-# Polling
-POLL_INTERVAL     = 3.0
+# ── POLLING ───────────────────────────────────────────────────────────────────
 POLL_INTERVAL_OK  = 3.0
 POLL_MAX_SLEEP    = 60.0
 POLL_BACKOFF_BASE = 2.0
 
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
-    '(KHTML, like Gecko) Version/17.3 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.3 Safari/605.1.15',
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ESTADO GLOBAL
 # ─────────────────────────────────────────────────────────────────────────────
-g_mults: list = []          # lista de dicts {'id', 'value', 'ts'}
-g_seen_ids: set = set()
-g_positions: list = []      # posición acumulada (para EMAs)
-g_ema4: list = []
-g_ema8: list = []
-g_ema20: list = []
+g_mults:     list = []
+g_seen_ids:  set  = set()
 
-g_signal_state = 'idle'          # 'idle', 'evaluating', 'so'
-g_signal_type: Optional[str] = None
-g_signal_strictness: int = 0
-g_signal_trigger_mult: float = 0.0
-g_last_signal_confidence: float = 0.0   # confianza global de la señal emitida
+g_signal_state        = 'idle'   # 'idle' | 'evaluating'
+g_signal_trigger_mult = 0.0
 
-g_all_chats: set = set()
-g_trend_favorable: Optional[bool] = None
-g_signal_msg_ids: dict = {}       # {chat_id: message_id}
+g_trend_favorable:    Optional[bool] = None
+g_signal_msg_ids:     dict           = {}
+g_last_trend_msg_id:  Optional[int]  = None
 
-# Estado para la estrategia Maestro
-g_maestro_results: list = []      # lista de dicts {'value': float, 'win': bool}
-g_maestro_last_prediction: dict = {}   # última predicción generada
+g_maestro_results: list = []        # más nuevo primero, contiene {'id','value','win'}
+g_maestro_last_prediction: dict = {}
 
 g_poller_status = {
-    'total_requests': 0,
-    'total_new_rounds': 0,
+    'total_requests':    0,
+    'total_new_rounds':  0,
     'consecutive_errors': 0,
-    'last_poll_ts': 0.0,
-    'last_round_ts': 0.0,
+    'last_poll_ts':      0.0,
+    'last_round_ts':     0.0,
 }
+
+daily_stats = {'date': None, 'wins': 0, 'losses': 0}
 
 bot = AsyncTeleBot(BOT_TOKEN)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MOTOR DE IA ORIGINAL (Bayes + Markov)
+# MARCADOR DIARIO
 # ─────────────────────────────────────────────────────────────────────────────
-class CrashMLEngine:
-    def __init__(self, history_size: int = ML_HISTORY_SIZE):
-        self.history_size = history_size
-        self.prior_win_prob = 0.50
-        self.recent_wins = deque(maxlen=50)
-        self.medium_wins = deque(maxlen=100)
-        self.long_wins = deque(maxlen=200)
-        self.markov_table: dict = {}
-        self.markov_seq = deque(maxlen=10)
-        self.mult_history = deque(maxlen=history_size)
-        self.loss_patterns: deque = deque(maxlen=30)
-        self._cur_winning_run: list = []
-        self.signal_log: list = []
-        logger.info("🤖 CrashMLEngine v3.0 inicializado")
+def get_current_argentina_date() -> str:
+    return (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d")
 
-    def update(self, value: float):
-        win = value >= WIN_TARGET
-        self.recent_wins.append(1 if win else 0)
-        self.medium_wins.append(1 if win else 0)
-        self.long_wins.append(1 if win else 0)
-        self.mult_history.append(value)
+def reset_daily_if_needed():
+    global daily_stats
+    today = get_current_argentina_date()
+    if daily_stats['date'] != today:
+        daily_stats = {'date': today, 'wins': 0, 'losses': 0}
+        logger.info(f"📆 Marcador diario reiniciado para {today}")
 
-        if len(self.markov_seq) >= 3:
-            state = tuple(list(self.markov_seq)[-3:])
-            entry = self.markov_table.setdefault(state, {'wins': 0, 'total': 0})
-            entry['total'] += 1
-            if win:
-                entry['wins'] += 1
+def update_daily_stats(win: bool):
+    reset_daily_if_needed()
+    if win:
+        daily_stats['wins'] += 1
+    else:
+        daily_stats['losses'] += 1
+    total    = daily_stats['wins'] + daily_stats['losses']
+    accuracy = daily_stats['wins'] / total * 100 if total > 0 else 0
+    msg = (
+        f"📊 MARCADOR DIARIO:\n"
+        f"✅ GANADAS: {daily_stats['wins']}\n"
+        f"❌ PERDIDAS: {daily_stats['losses']}\n"
+        f"\n📈 ACIERTOS = {accuracy:.2f}%"
+    )
+    asyncio.create_task(broadcast(msg))
 
-        sym = 'W' if win else 'L'
-        self.markov_seq.append(sym)
-
-        if win:
-            self._cur_winning_run.append(round(value, 2))
-        else:
-            if self._cur_winning_run:
-                self.loss_patterns.append(tuple(self._cur_winning_run))
-            self._cur_winning_run = []
-
-    def bayesian_win_prob(self) -> float:
-        if len(self.recent_wins) < 5:
-            return self.prior_win_prob
-        w_rec = sum(self.recent_wins) / len(self.recent_wins)
-        w_med = sum(self.medium_wins) / len(self.medium_wins) if self.medium_wins else self.prior_win_prob
-        w_lon = sum(self.long_wins) / len(self.long_wins) if self.long_wins else self.prior_win_prob
-        evidence = 0.50 * w_rec + 0.30 * w_med + 0.20 * w_lon
-        alpha = min(len(self.long_wins), 200) / 200.0
-        posterior = alpha * evidence + (1.0 - alpha) * self.prior_win_prob
-        return max(0.01, min(0.99, posterior))
-
-    def markov_prob(self) -> Optional[float]:
-        if len(self.markov_seq) < 3:
-            return None
-        state = tuple(list(self.markov_seq)[-3:])
-        entry = self.markov_table.get(state)
-        if not entry or entry['total'] < MARKOV_MIN_OBS:
-            return None
-        return entry['wins'] / entry['total']
-
-    def volatility_index(self) -> float:
-        if len(self.mult_history) < 10:
-            return 0.5
-        sample = list(self.mult_history)[-30:]
-        try:
-            std = statistics.stdev(sample)
-            mean = statistics.mean(sample)
-            cv = std / mean if mean > 0 else 0.0
-            return max(0.0, min(1.0, cv / 3.0))
-        except Exception:
-            return 0.5
-
-    def streak_analysis(self) -> dict:
-        seq = list(self.markov_seq)
-        if not seq:
-            return {'type': 'neutral', 'length': 0, 'prob_boost': 0.0, 'last': '?'}
-        last = seq[-1]
-        streak = 1
-        for i in range(len(seq) - 2, -1, -1):
-            if seq[i] == last:
-                streak += 1
-            else:
-                break
-        prob_boost = 0.0
-        streak_type = 'neutral'
-        if last == 'L':
-            streak_type = 'loss_streak'
-            prob_boost = min(0.15, streak * 0.025)
-        elif last == 'W':
-            streak_type = 'win_streak'
-            prob_boost = -min(0.10, streak * 0.015)
-        return {'type': streak_type, 'length': streak, 'prob_boost': prob_boost, 'last': last}
-
-    def loss_pattern_risk(self) -> float:
-        if not self.loss_patterns or not self._cur_winning_run:
-            return 0.0
-        cur_len = len(self._cur_winning_run)
-        similar = 0
-        sample_pool = list(self.loss_patterns)[-15:]
-        for pattern in sample_pool:
-            if abs(len(pattern) - cur_len) <= 1:
-                similar += 1
-        return max(0.0, min(1.0, similar / len(sample_pool)))
-
-    def compute_signal_confidence(self, ema_signal_level: int = 1) -> dict:
-        bayes_p = self.bayesian_win_prob()
-        markov_p = self.markov_prob()
-        streak = self.streak_analysis()
-        vol = self.volatility_index()
-        loss_risk = self.loss_pattern_risk()
-
-        if markov_p is not None:
-            base_prob = 0.55 * bayes_p + 0.45 * markov_p
-        else:
-            base_prob = bayes_p
-
-        base_prob = max(0.01, min(0.99, base_prob + streak['prob_boost']))
-        vol_factor = 1.0 - (vol * 0.20)
-        risk_factor = 1.0 - (loss_risk * 0.15)
-        ema_bonus = 0.05 if ema_signal_level >= 2 else (0.08 if ema_signal_level >= 3 else 0.0)
-        confidence = base_prob * vol_factor * risk_factor + ema_bonus
-        confidence = max(0.01, min(0.99, confidence))
-        return {
-            'confidence': confidence,
-            'pct': round(confidence * 100, 1),
-            'bayes_pct': round(bayes_p * 100, 1),
-            'markov_pct': round(markov_p * 100, 1) if markov_p is not None else None,
-            'volatility_pct': round(vol * 100, 1),
-            'loss_risk_pct': round(loss_risk * 100, 1),
-            'streak': streak,
-            'recommendation': self._label(confidence),
-        }
+# ─────────────────────────────────────────────────────────────────────────────
+# ESTRATEGIA MODERADA (Filtro de confirmación basado en gráfico moderado del HTML)
+# ─────────────────────────────────────────────────────────────────────────────
+class ModerateStrategy:
+    """Replica la lógica del gráfico moderado: detección de alertas 1.50 y 2.00"""
 
     @staticmethod
-    def _label(confidence: float) -> str:
-        if confidence >= 0.72:   return '🟢 ALTA'
-        elif confidence >= 0.60: return '🟡 MEDIA'
-        elif confidence >= 0.50: return '🟠 BAJA'
-        else:                    return '🔴 MUY BAJA'
+    def compute_positions(values: List[float]) -> List[int]:
+        """
+        Convierte lista de multiplicadores en posiciones acumuladas.
+        Regla: si valor >= 2.00 → +1, si < 2.00 → -1.
+        Retorna lista del mismo tamaño, partiendo de 0.
+        """
+        positions = [0]
+        for v in values[1:]:
+            delta = 1 if v >= WIN_TARGET else -1
+            positions.append(positions[-1] + delta)
+        return positions
 
-    def get_market_reading(self) -> dict:
-        bayes = self.bayesian_win_prob()
-        markov_p = self.markov_prob()
-        streak = self.streak_analysis()
-        vol = self.volatility_index()
-        loss_risk = self.loss_pattern_risk()
+    @staticmethod
+    def compute_emas(positions: List[int], periods: List[int]) -> Dict[int, List[float]]:
+        """Calcula EMAs para cada periodo sobre la lista de posiciones."""
+        emas = {}
+        for p in periods:
+            if len(positions) < p:
+                emas[p] = []
+                continue
+            k = 2.0 / (p + 1)
+            ema_vals = [positions[0]]
+            for i in range(1, len(positions)):
+                ema_vals.append(ema_vals[-1] + k * (positions[i] - ema_vals[-1]))
+            emas[p] = ema_vals
+        return emas
 
-        if bayes >= 0.60 and vol < 0.40:
-            state = '🟢 FAVORABLE'
-        elif bayes >= 0.52 and vol < 0.65:
-            state = '🟡 NEUTRAL'
-        elif bayes < 0.44 or vol >= 0.72:
-            state = '🔴 DESFAVORABLE'
-        else:
-            state = '🟠 PRECAUCIÓN'
+    @classmethod
+    def check_alerts(cls, values: List[float]) -> Tuple[bool, Optional[float]]:
+        """
+        Detecta si en el último valor hay una alerta moderada activa.
+        Retorna (hay_alerta, target) donde target puede ser 1.50 o 2.00.
+        """
+        if len(values) < MODERATE_MIN_DATA:
+            return False, None
 
-        if len(self.mult_history) >= 10:
-            sample = list(self.mult_history)[-20:]
-            avg = round(statistics.mean(sample), 2)
-            mx = round(max(sample), 2)
-            mn = round(min(sample), 2)
-            median = round(statistics.median(sample), 2)
-        else:
-            avg = mx = mn = median = 0.0
+        positions = cls.compute_positions(values)
+        emas = cls.compute_emas(positions, [4, 8, 20])
 
-        markov_states = len(self.markov_table)
-        markov_obs = sum(e['total'] for e in self.markov_table.values())
-        return {
-            'state': state,
-            'win_prob_pct': round(bayes * 100, 1),
-            'markov_pct': round(markov_p * 100, 1) if markov_p else None,
-            'volatility_pct': round(vol * 100, 1),
-            'loss_risk_pct': round(loss_risk * 100, 1),
-            'streak': streak,
-            'avg': avg,
-            'max_r': mx,
-            'min_r': mn,
-            'median': median,
-            'total_processed': len(self.mult_history),
-            'markov_states': markov_states,
-            'markov_obs': markov_obs,
-        }
+        # Asegurar que tenemos todas las EMAs con al menos 2 valores
+        for p in [4, 8, 20]:
+            if len(emas.get(p, [])) < 2:
+                return False, None
 
-    def record_signal(self, confidence: float, result: bool):
-        self.signal_log.append({'confidence': confidence, 'result': result, 'ts': time.time()})
-        if len(self.signal_log) > 500:
-            self.signal_log = self.signal_log[-500:]
+        last_pos      = positions[-1]
+        last_ema4     = emas[4][-1]
+        last_ema8     = emas[8][-1]
+        last_ema20    = emas[20][-1]
+        prev_ema4     = emas[4][-2]
+        prev_ema8     = emas[8][-2]
+        prev_ema20    = emas[20][-2]
 
-    def performance_stats(self) -> dict:
-        if not self.signal_log:
-            return {'total': 0, 'accuracy': None, 'avg_conf': None, 'high_conf_acc': None}
-        total = len(self.signal_log)
-        wins = sum(1 for s in self.signal_log if s['result'])
-        acc = wins / total
-        avg_c = sum(s['confidence'] for s in self.signal_log) / total
-        hi = [s for s in self.signal_log if s['confidence'] >= 0.65]
-        hi_acc = (sum(1 for s in hi if s['result']) / len(hi)) if hi else None
-        return {
-            'total': total,
-            'accuracy': round(acc * 100, 1),
-            'avg_conf': round(avg_c * 100, 1),
-            'high_total': len(hi),
-            'high_conf_acc': round(hi_acc * 100, 1) if hi_acc is not None else None,
-        }
+        # ─── Alerta 1.50 ──────────────────────────────────────────────
+        alert_150 = False
 
-g_ml_engine = CrashMLEngine()
+        # Condición A: patrón de cambios -1, -1, -1, +1 y precio debajo de EMA4 y EMA8
+        if len(values) >= 4:
+            cambios = [1 if v >= WIN_TARGET else -1 for v in values[-4:]]
+            if cambios == [-1, -1, -1, 1] and last_pos <= last_ema4 and last_pos <= last_ema8:
+                alert_150 = True
+
+        # Condición B: cruce EMA4 por encima de EMA8
+        if not alert_150 and prev_ema4 <= prev_ema8 and last_ema4 > last_ema8:
+            alert_150 = True
+
+        # Condición C: precio cerca de soporte mínimo y por encima de las tres EMAs
+        if not alert_150 and len(positions) >= 20:
+            soporte = min(positions[-20:])
+            if last_pos <= soporte * 1.01 and last_pos > last_ema4 and last_pos > last_ema8 and last_pos > last_ema20:
+                alert_150 = True
+
+        # ─── Alerta 2.00 ──────────────────────────────────────────────
+        alert_200 = False
+
+        # Condición D: cruce EMA8 por encima de EMA20
+        if prev_ema8 <= prev_ema20 and last_ema8 > last_ema20:
+            alert_200 = True
+
+        # Condición E: patrón de tres puntos consecutivos (valle) con precio sobre EMAs
+        if not alert_200 and len(positions) >= 3:
+            a, b, c = positions[-3:]
+            if abs(a - c) <= 1 and b > a and last_pos > last_ema4 and last_pos > last_ema8 and last_pos > last_ema20:
+                alert_200 = True
+
+        # Condición F: dos verdes consecutivos y EMAs en orden (4>8>20)
+        if not alert_200 and len(values) >= 2 and values[-1] >= WIN_TARGET and values[-2] >= WIN_TARGET:
+            if last_ema4 > last_ema8 > last_ema20 and (len(values) < 3 or values[-3] < WIN_TARGET):
+                alert_200 = True
+
+        # Prioridad: alerta 2.00 tiene prioridad sobre 1.50
+        if alert_200:
+            return True, 2.00
+        if alert_150:
+            return True, 1.50
+        return False, None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ESTRATEGIA MAESTRO (adaptada de Maestro.html)
+# ESTRATEGIA MAESTRO (original) — analyzeTrend() + EMA3/EMA5 reales en decisiones
 # ─────────────────────────────────────────────────────────────────────────────
 class MaestroStrategy:
-    """Lógica predictiva del juego Maestro aplicada a Crash (objetivo 2.00x)"""
 
+    # ── EMA ──────────────────────────────────────────────────────────────────
     @staticmethod
-    def get_category(val: float) -> str:
-        if val < 1.50:
-            return 'low'
-        if val < 2.00:
-            return 'mid'
-        if val < 3.00:
-            return 'good'
-        if val < 10.00:
-            return 'high'
-        return 'vhigh'
+    def _ema(values: List[float], period: int) -> List[float]:
+        if not values:
+            return []
+        k   = 2.0 / (period + 1)
+        ema = [values[0]]
+        for v in values[1:]:
+            ema.append(ema[-1] + k * (v - ema[-1]))
+        return ema
 
-    @staticmethod
-    def analyze_trend(results: List[Dict]) -> Dict[str, Any]:
-        """
-        Analiza la tendencia según la lógica Maestro.
-        Retorna: prediction, risk, detail, confidence.
-        """
+    @classmethod
+    def get_ema_state(cls, results: List[Dict]) -> Dict[str, Any]:
+        if len(results) < 5:
+            return {
+                'ema3': None, 'ema5': None,
+                'prev_ema3': None, 'prev_ema5': None,
+                'bullish': None, 'crossover_up': False, 'crossover_down': False,
+                'price_above_ema3': None, 'ema_boost': 0.0, 'ema_label': '—',
+                'ready': False,
+            }
+
+        window = results[:min(20, len(results))]
+        vals   = [r['value'] for r in reversed(window)]
+
+        ema3_series = cls._ema(vals, 3)
+        ema5_series = cls._ema(vals, 5)
+
+        ema3      = ema3_series[-1]
+        ema5      = ema5_series[-1]
+        prev_ema3 = ema3_series[-2] if len(ema3_series) >= 2 else ema3
+        prev_ema5 = ema5_series[-2] if len(ema5_series) >= 2 else ema5
+        last_price = vals[-1]
+
+        bullish          = ema3 > ema5
+        crossover_up     = (prev_ema3 <= prev_ema5) and (ema3 > ema5)
+        crossover_down   = (prev_ema3 >= prev_ema5) and (ema3 < ema5)
+        price_above_ema3 = last_price > ema3
+
+        boost = 0.0
+        if crossover_up:
+            boost = +0.12
+        elif crossover_down:
+            boost = -0.15
+        elif bullish and price_above_ema3:
+            boost = +0.07
+        elif bullish:
+            boost = +0.04
+        elif not bullish and not price_above_ema3:
+            boost = -0.10
+        elif not bullish:
+            boost = -0.05
+
+        if crossover_up:
+            label = f'🟢 Cruce EMA3↑EMA5 ({ema3:.2f}/{ema5:.2f})'
+        elif crossover_down:
+            label = f'🔴 Cruce EMA3↓EMA5 ({ema3:.2f}/{ema5:.2f})'
+        elif bullish:
+            label = f'📗 EMA3 {ema3:.2f} > EMA5 {ema5:.2f}'
+        else:
+            label = f'📕 EMA3 {ema3:.2f} < EMA5 {ema5:.2f}'
+
+        return {
+            'ema3': ema3, 'ema5': ema5,
+            'prev_ema3': prev_ema3, 'prev_ema5': prev_ema5,
+            'bullish': bullish,
+            'crossover_up': crossover_up, 'crossover_down': crossover_down,
+            'price_above_ema3': price_above_ema3,
+            'ema_boost': boost,
+            'ema_label': label,
+            'ready': True,
+        }
+
+    # ── ANÁLISIS PRINCIPAL ────────────────────────────────────────────────────
+    @classmethod
+    def analyze_trend(cls, results: List[Dict]) -> Dict[str, Any]:
         if len(results) < 3:
-            return {'prediction': 'Cargando datos...', 'risk': 'wait', 'detail': 'Esperando más resultados', 'confidence': 0.0}
+            return {
+                'prediction': 'Cargando datos...',
+                'risk':       'wait',
+                'detail':     'Esperando resultados',
+                'confidence': 0.0,
+                'ema': {},
+            }
 
-        vals = [r['value'] for r in results[:10]]
-        avg = sum(vals) / len(vals)
-        last3 = vals[:3]
-        last3avg = sum(last3) / len(last3)
+        recent      = results[:min(10, len(results))]
+        vals        = [r['value'] for r in recent]
+        avg         = sum(vals) / len(vals)
+        last3       = vals[:3]
+        last3avg    = sum(last3) / len(last3)
         green_ratio = sum(1 for v in vals if v >= WIN_TARGET) / len(vals)
+        last_is_green = vals[0] >= WIN_TARGET
+        second_last   = vals[1] if len(vals) > 1 else vals[0]
 
-        last = vals[0]
-        second_last = vals[1] if len(vals) > 1 else vals[0]
-
-        # Contar racha actual de rojos (menos de 2.00)
-        streak_red = 0
+        streak = 0
         for v in vals:
             if v >= WIN_TARGET:
                 break
-            streak_red += 1
+            streak += 1
 
-        # Zona de entrada: rojo seguido de verde
-        if second_last < WIN_TARGET and last >= WIN_TARGET:
-            confidence = 0.65 + min(0.20, streak_red * 0.05)
-            return {
-                'prediction': 'Zona de entrada detectada',
-                'risk': 'low',
-                'detail': f'Rojo seguido de verde (racha roja: {streak_red})',
-                'confidence': min(0.85, confidence)
+        ema = cls.get_ema_state(results)
+        base_result = None
+
+        if streak >= 3 and last_is_green:
+            base_result = {
+                'prediction': '🎯 Zona de entrada detectada',
+                'risk':       'low',
+                'detail':     f'{streak} rojas → verde. Posible racha.',
+                'confidence': min(0.85, 0.70 + (streak - 3) * 0.05),
+            }
+        elif second_last < WIN_TARGET and last_is_green:
+            base_result = {
+                'prediction': '📍 Posible zona de entrada',
+                'risk':       'low',
+                'detail':     'Rojo → verde. Reversión detectada.',
+                'confidence': 0.70,
+            }
+        elif last_is_green and last3avg > avg:
+            base_result = {
+                'prediction': '📈 Tendencia alcista activa',
+                'risk':       'low',
+                'detail':     f'Últimas 3: {last3avg:.2f}x > Media: {avg:.2f}x',
+                'confidence': 0.65,
+            }
+        elif last_is_green and second_last >= WIN_TARGET:
+            base_result = {
+                'prediction': '⚡ Racha verde — Precaución',
+                'risk':       'medium',
+                'detail':     f'Tasa verdes: {green_ratio*100:.0f}%',
+                'confidence': 0.45,
+            }
+        elif vals[0] >= 5.0:
+            base_result = {
+                'prediction': '🚀 ¡Multiplicador alto!',
+                'risk':       'medium',
+                'detail':     f'{vals[0]:.2f}x registrado',
+                'confidence': 0.45,
+            }
+        elif streak >= 2:
+            risk = 'low' if streak >= 4 else 'medium'
+            conf = min(0.75, 0.55 + (streak - 2) * 0.07) if streak >= 4 else 0.50
+            base_result = {
+                'prediction': f'⏳ Racha roja ({streak})',
+                'risk':       risk,
+                'detail':     'Zona de entrada próxima.' if streak >= 4 else 'Esperando señal.',
+                'confidence': conf,
+            }
+        elif last_is_green:
+            base_result = {
+                'prediction': '👀 Monitoreando...',
+                'risk':       'medium',
+                'detail':     f'Último: {vals[0]:.2f}x | Avg: {avg:.2f}x',
+                'confidence': 0.40,
+            }
+        else:
+            base_result = {
+                'prediction': '⌛ Esperando señal...',
+                'risk':       'wait',
+                'detail':     f'Verdes: {green_ratio*100:.0f}% | Avg: {avg:.2f}x',
+                'confidence': 0.0,
             }
 
-        # Rachas largas de rojo (>=3) predicen posible verde
-        if streak_red >= 3:
-            confidence = 0.55 + min(0.25, (streak_red - 2) * 0.07)
+        # Aplicar ajuste EMA
+        if ema['ready']:
+            conf_adj = max(0.0, min(0.95, base_result['confidence'] + ema['ema_boost']))
+            risk_adj = base_result['risk']
+
+            if ema['crossover_down'] and risk_adj == 'low':
+                risk_adj = 'medium'
+                logger.info(f"⚠️ EMA cruce bajista — riesgo degradado a 'medium'")
+
+            if (ema['crossover_up']
+                    and risk_adj == 'medium'
+                    and base_result['confidence'] >= 0.50
+                    and conf_adj >= MAESTRO_MIN_CONFIDENCE):
+                risk_adj = 'low'
+                logger.info(f"✅ EMA cruce alcista — riesgo promovido a 'low'")
+
+            if not ema['bullish'] and not ema['price_above_ema3'] and risk_adj == 'low':
+                conf_adj = max(0.0, conf_adj - 0.05)
+
+            detail_with_ema = f"{base_result['detail']} | {ema['ema_label']}"
             return {
-                'prediction': f'Posible entrada tras {streak_red} rojos',
-                'risk': 'low' if streak_red >= 4 else 'medium',
-                'detail': f'Racha roja de {streak_red}',
-                'confidence': min(0.80, confidence)
+                'prediction': base_result['prediction'],
+                'risk':       risk_adj,
+                'detail':     detail_with_ema,
+                'confidence': conf_adj,
+                'ema':        ema,
             }
 
-        # Tendencia alcista: últimos 3 superan media general
-        if last3avg > avg and last >= WIN_TARGET:
-            confidence = 0.60
-            return {
-                'prediction': 'Tendencia alcista activa',
-                'risk': 'low',
-                'detail': f'Últimos 3: {last3avg:.2f}x > Media: {avg:.2f}x',
-                'confidence': confidence
-            }
+        base_result['ema'] = ema
+        return base_result
 
-        # Señal neutra
-        return {
-            'prediction': 'Monitoreando...',
-            'risk': 'medium',
-            'detail': f'Último: {last:.2f}x | Verdes: {green_ratio*100:.0f}%',
-            'confidence': 0.35
-        }
-
+    # ── SOPORTE / RESISTENCIA ─────────────────────────────────────────────────
     @staticmethod
     def calculate_support_resistance(results: List[Dict]) -> Dict[str, Optional[float]]:
         values = [r['value'] for r in results]
         if len(values) < 10:
             return {'support': None, 'resistance': None}
-        window = max(3, len(values) // 8)
+        window   = max(3, len(values) // 8)
         smoothed = []
         for i in range(len(values)):
             lo = max(0, i - 3)
             hi = min(len(values) - 1, i + 3)
             smoothed.append(sum(values[lo:hi+1]) / (hi - lo + 1))
-        support = None
-        resistance = None
+        support = resistance = None
         for i in range(window, len(smoothed) - window):
             is_min = all(smoothed[i] <= smoothed[j] for j in range(i - window, i + window + 1) if j != i)
             is_max = all(smoothed[i] >= smoothed[j] for j in range(i - window, i + window + 1) if j != i)
@@ -434,43 +446,71 @@ class MaestroStrategy:
                 resistance = smoothed[i]
         return {'support': support, 'resistance': resistance}
 
+    # ── DECISIÓN DE ENTRADA (con filtro moderado) ──────────────────────────────
     def should_enter(self, results: List[Dict]) -> Tuple[bool, float, str]:
-        if not USE_MAESTRO_STRATEGY or len(results) < 3:
-            return False, 0.0, "Estrategia desactivada o datos insuficientes"
+        """
+        Señal SÓLO si:
+          • risk == 'low'
+          • confidence >= MAESTRO_MIN_CONFIDENCE
+          • EMA no está en cruce bajista activo (crossover_down bloquea)
+          • **ADICIONALMENTE: existe una alerta moderada activa (1.50 o 2.00)**
+        """
+        if len(results) < 3:
+            return False, 0.0, "Datos insuficientes"
+
         trend = self.analyze_trend(results)
-        conf = trend['confidence']
-        # Solo generar señal si la confianza supera el umbral
-        if conf >= MAESTRO_MIN_CONFIDENCE and trend['risk'] in ('low', 'medium'):
-            return True, conf, trend['detail']
-        return False, conf, trend['detail']
+        conf  = trend['confidence']
+        ema   = trend.get('ema', {})
+
+        # Bloqueo duro: cruce bajista activo
+        if ema.get('crossover_down', False):
+            logger.info("🚫 Señal bloqueada — cruce EMA bajista activo")
+            return False, conf, f"Bloqueado: cruce EMA bajista | {ema.get('ema_label','')}"
+
+        # Condiciones Maestro
+        if trend['risk'] != 'low' or conf < MAESTRO_MIN_CONFIDENCE:
+            return False, conf, trend['detail']
+
+        # ─── FILTRO MODERADO (confirmación adicional) ─────────────────────────
+        values = [r['value'] for r in results[:50]]  # últimos 50 multiplicadores
+        alerta_moderada, target_mod = ModerateStrategy.check_alerts(values)
+
+        if not alerta_moderada:
+            logger.info(f"🚫 Señal Maestro bloqueada por filtro moderado: sin alerta activa")
+            return False, conf, f"{trend['detail']} (sin alerta moderada)"
+
+        logger.info(f"✅ Señal Maestro CONFIRMADA por alerta moderada {target_mod:.2f}x")
+        motivo_extra = f" | Confirmación moderada {target_mod:.2f}x"
+        return True, conf, trend['detail'] + motivo_extra
+
 
 maestro_strategy = MaestroStrategy()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GESTIÓN DE SESIÓN (columnas, intentos, fichas)
+# SESIÓN GLOBAL — Gestión 3C × 2I
 # ─────────────────────────────────────────────────────────────────────────────
 class GlobalSession:
-    IDLE = 'idle'
-    EVALUATING = 'evaluating'
-    WAITING_SO = 'waiting_so'
-    DONE = 'done'
+    IDLE           = 'idle'
+    EVALUATING     = 'evaluating'
+    WAITING_SIGNAL = 'waiting_signal'
+    DONE           = 'done'
 
     def __init__(self, carry_fichas: list = None):
-        self.base_bet = BASE_BET
-        self.state = self.IDLE
-        self.scale = 1
-        self.col = 1
-        self.attempt = 1
-        self.lost = 0.0
-        self.cur_bet = BASE_BET
-        self.entries = 0
-        self.wins = 0
-        self.losses = 0
-        self.created = datetime.now()
-        self.signal_trigger_mult = 0.0
+        self.base_bet              = BASE_BET
+        self.state                 = self.IDLE
+        self.scale                 = 1
+        self.col                   = 1
+        self.attempt               = 1
+        self.lost                  = 0.0
+        self.cur_bet               = BASE_BET
+        self.entries               = 0
+        self.wins                  = 0
+        self.losses                = 0
+        self.created               = datetime.now()
+        self.signal_trigger_mult   = 0.0
         self.attempt1_result_value = 0.0
-        self.fichas: list = carry_fichas if carry_fichas is not None else []
-        self._cur_ficha: dict = None
+        self.fichas: list          = carry_fichas if carry_fichas is not None else []
+        self._cur_ficha: dict      = None
         self._col_attempt_bets: list = []
 
     def start_ficha(self):
@@ -482,21 +522,21 @@ class GlobalSession:
         }
 
     def on_result(self, win: bool) -> tuple:
-        self.entries += 1
-        prev_bet = self.cur_bet
-        prev_col = self.col
+        """Retorna (tipo, monto_apostado)."""
+        self.entries  += 1
+        prev_bet       = self.cur_bet
+        prev_col       = self.col
         if self._cur_ficha is not None:
-            col_key = f'c{prev_col}'
-            self._cur_ficha[col_key] = self._cur_ficha.get(col_key, 0.0) + prev_bet
+            self._cur_ficha[f'c{prev_col}'] = self._cur_ficha.get(f'c{prev_col}', 0.0) + prev_bet
         self._col_attempt_bets.append(prev_bet)
 
         if win:
-            self.wins += 1
-            self.lost = 0.0
-            self.cur_bet = self.base_bet
-            self.col = 1
-            self.attempt = 1
-            self.scale += 1
+            self.wins        += 1
+            self.lost         = 0.0
+            self.cur_bet      = self.base_bet
+            self.col          = 1
+            self.attempt      = 1
+            self.scale       += 1
             self._col_attempt_bets = []
             if self._cur_ficha is not None:
                 self._cur_ficha['result'] = 'win'
@@ -509,14 +549,16 @@ class GlobalSession:
                 return ('cycle_win', prev_bet)
             self.state = self.IDLE
             return ('win', prev_bet)
+
         else:
-            self.losses += 1
-            self.lost += prev_bet
-            self.cur_bet = self.lost + self.base_bet
-            self.attempt += 1
+            self.losses   += 1
+            self.lost     += prev_bet
+            self.cur_bet   = self.lost + self.base_bet
+            self.attempt  += 1
+
             if self.attempt > MAX_ATTS:
                 self.attempt = 1
-                self.col += 1
+                self.col    += 1
                 if self.col > MAX_COLS:
                     if self._cur_ficha is not None:
                         self._cur_ficha['result'] = 'loss'
@@ -526,44 +568,36 @@ class GlobalSession:
                         self.fichas = self.fichas[-100:]
                     self.state = self.DONE
                     return ('cycle_loss', prev_bet)
-                self.state = self.IDLE
-                return ('new_col', prev_bet)
+                else:
+                    self.state = self.IDLE
+                    return ('new_col', prev_bet)
             else:
-                self.state = self.WAITING_SO
-                return ('so', prev_bet)
+                self.state = self.WAITING_SIGNAL
+                return ('wait_signal', prev_bet)
 
     def status_short(self) -> str:
         total_f = len(self.fichas)
-        wins_f = sum(1 for f in self.fichas if f['result'] == 'win')
-        pct = round(wins_f / total_f * 100, 2) if total_f > 0 else 0.0
+        wins_f  = sum(1 for f in self.fichas if f['result'] == 'win')
+        pct     = wins_f / total_f * 100 if total_f > 0 else 0.0
         return f"📈 Ganadas/Perdidas: `{pct:.2f}%`"
+
 
 g_session = GlobalSession()
 
 def reset_global_session():
     global g_session
     old_fichas = list(g_session.fichas)
-    g_session = GlobalSession(carry_fichas=old_fichas)
+    g_session  = GlobalSession(carry_fichas=old_fichas)
     logger.info("🔄 Sesión global reiniciada — fichas preservadas")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FUNCIONES AUXILIARES
 # ─────────────────────────────────────────────────────────────────────────────
 def argentina_time() -> str:
-    now_arg = datetime.utcnow() - timedelta(hours=3)
-    return now_arg.strftime("%H:%M")
-
-def calc_ema(data: list, period: int) -> list:
-    if not data:
-        return []
-    k = 2 / (period + 1)
-    ema = [data[0]]
-    for i in range(1, len(data)):
-        ema.append((data[i] - ema[i - 1]) * k + ema[i - 1])
-    return ema
+    return (datetime.utcnow() - timedelta(hours=3)).strftime("%H:%M")
 
 def get_quota_stats(n: int = 200) -> dict:
-    data = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
+    data  = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
     total = len(data)
     if total == 0:
         return {'total': 0, 'has_enough': False, 'favorable': None,
@@ -573,15 +607,10 @@ def get_quota_stats(n: int = 200) -> dict:
     r2 = sum(1 for m in data if 2.00 <= m['value'] < 5.00)
     r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
     r4 = sum(1 for m in data if m['value'] >= 10.00)
-    pct1 = r1 / total * 100
-    pct2 = r2 / total * 100
-    pct3 = r3 / total * 100
-    pct4 = r4 / total * 100
-    unfavorable = pct1 > 52.0 or pct2 < 29.0
+    pct1, pct2, pct3, pct4 = r1/total*100, r2/total*100, r3/total*100, r4/total*100
+    unfavorable = pct1 > 54.0 or pct2 < 28.0
     return {
-        'total': total,
-        'has_enough': total >= 200,
-        'favorable': not unfavorable,
+        'total': total, 'has_enough': total >= 200, 'favorable': not unfavorable,
         'count_100_199': r1, 'count_200_499': r2, 'count_500_999': r3, 'count_1000_plus': r4,
         'pct_100_199': pct1, 'pct_200_499': pct2, 'pct_500_999': pct3, 'pct_1000_plus': pct4,
     }
@@ -590,9 +619,10 @@ def quota_stats_text(stats: dict) -> str:
     if stats['total'] == 0:
         return "📡 _Sin datos suficientes para analizar cuotas._\n"
     n_label = "200" if stats['has_enough'] else f"{stats['total']} (acumulando...)"
-    r1_flag = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
-    r2_flag = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
-    fav_line = "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_" if stats['favorable'] else "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
+    r1_flag = " ✅" if stats['pct_100_199'] <= 54.0 else " ❌"
+    r2_flag = " ✅" if stats['pct_200_499'] >= 28.0 else " ❌"
+    fav_line = "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_" if stats['favorable'] \
+               else "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
     return (
         f"📈 *Análisis de la Tendencia últimos*\n"
         f"      *{n_label} multiplicadores*\n"
@@ -602,28 +632,6 @@ def quota_stats_text(stats: dict) -> str:
         f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
         " \n" + fav_line + "\n"
     )
-
-def check_moderate_signal() -> Optional[Tuple[str, int]]:
-    pos, e4, e8, e20, data = g_positions, g_ema4, g_ema8, g_ema20, g_mults
-    if len(data) < 4 or len(pos) < 4:
-        return None
-    cur_pos = pos[-1]
-    cur_e4 = e4[-1] if e4 else cur_pos
-    cur_e8 = e8[-1] if e8 else cur_pos
-    cur_e20 = e20[-1] if e20 else cur_pos
-    prv_e8 = e8[-2] if len(e8) > 1 else cur_e8
-    prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
-    if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
-        return ('alert200', 1)
-    if len(pos) >= 3:
-        a, b, c = pos[-3], pos[-2], pos[-1]
-        if abs(a - c) <= 1 and b > a and cur_pos > cur_e4 and cur_pos > cur_e8 and cur_pos > cur_e20:
-            return ('alert200', 2)
-    if len(data) >= 2 and data[-1]['value'] >= WIN_TARGET and data[-2]['value'] >= WIN_TARGET and cur_e4 > cur_e8 > cur_e20:
-        before = data[-3] if len(data) >= 3 else None
-        if before is None or before['value'] < WIN_TARGET:
-            return ('alert200', 3)
-    return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BROADCAST Y MENSAJERÍA
@@ -637,83 +645,91 @@ async def broadcast(msg: str, parse_mode: str = None) -> dict:
         return {}
 
 async def broadcast_trend_change(favorable: bool):
-    hora = argentina_time()
+    global g_last_trend_msg_id
+    hora  = argentina_time()
     stats = get_quota_stats(200)
     trend = quota_stats_text(stats)
     header = f"🟢 *TENDENCIA FAVORABLE — {hora}*\n" if favorable else f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
-    msg = header + "━━━━━━━━━━━━━━━━━━━━━━━\n" + trend
-    await broadcast(msg, parse_mode='Markdown')
+    msg    = header + "━━━━━━━━━━━━━━━━━━━━━━━\n" + trend
 
-async def _send_signal(trigger: float, strictness: int, ml_data: dict, maestro_data: dict = None):
-    """Envía señal con información combinada de IA y Maestro."""
+    if g_last_trend_msg_id is not None:
+        try:
+            await bot.delete_message(CHANNEL_ID, g_last_trend_msg_id)
+            logger.info(f"🗑️ Mensaje anterior de tendencia eliminado (ID: {g_last_trend_msg_id})")
+        except Exception as e:
+            logger.warning(f"No se pudo eliminar mensaje de tendencia: {e}")
+        g_last_trend_msg_id = None
+
+    result = await broadcast(msg, parse_mode='Markdown')
+    if CHANNEL_ID in result:
+        g_last_trend_msg_id = result[CHANNEL_ID]
+        logger.info(f"📢 Nuevo mensaje de tendencia enviado (ID: {g_last_trend_msg_id})")
+
+async def _send_signal(trigger: float, reason: str, is_second_opportunity: bool = False):
     global g_signal_msg_ids
-    lines = [f"🚨 Entrar después de: `{trigger:.2f}x`", f"💎 Señal para `{WIN_TARGET:.2f}x`",
-             f"🇺🇲 Apuesta USD: `${g_session.cur_bet:.2f}`",
-             f"🆔 Gestión C{g_session.col} — Intento 1/{MAX_ATTS}"]
-    if maestro_data and maestro_data.get('active'):
-        lines.append(f"🧠 Estrategia: Maestro | razón: {maestro_data['reason']}")
+    if is_second_opportunity:
+        for chat_id, msg_id in list(g_signal_msg_ids.items()):
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+        g_signal_msg_ids = {}
+        title   = "💎 Segunda Oportunidad —"
+        intento = f"2/{MAX_ATTS}"
     else:
-        lines.append(f"🤖 Confianza IA: {ml_data['pct']}% ({ml_data['recommendation']})")
-    txt = "\n".join(lines)
+        title   = "💎 Señal para"
+        intento = f"1/{MAX_ATTS}"
+
+    txt = (
+        f"🚨 Entrar después de: `{trigger:.2f}x`\n"
+        f"{title} `{WIN_TARGET:.2f}x`\n"
+        f"🇺🇲 Apuesta USD: `${g_session.cur_bet:.2f}`\n"
+        f"🆔 Gestión C{g_session.col} — Intento {intento}\n"
+        f"🧠 {reason}"
+    )
     g_signal_msg_ids = await broadcast(txt, parse_mode='Markdown')
 
-async def _send_so_signal(trigger_value: float):
-    global g_signal_msg_ids
-    for chat_id, msg_id in list(g_signal_msg_ids.items()):
-        try:
-            await bot.delete_message(chat_id, msg_id)
-        except Exception:
-            pass
-    g_signal_msg_ids = {}
-    txt = (f"🚨 Entrar después de: `{trigger_value:.2f}x`\n"
-           f"💎 Segunda Oportunidad — `{WIN_TARGET:.2f}x`\n"
-           f"🇺🇲 Apuesta USD: `${g_session.cur_bet:.2f}`\n"
-           f"🆔 Gestión C{g_session.col} — Intento 2/{MAX_ATTS}")
-    await broadcast(txt, parse_mode='Markdown')
-
-async def _dispatch_result(value: float, tipo: str, bet: float, is_so: bool):
+async def _dispatch_result(value: float, tipo: str, bet: float):
     global g_session
-    gale_num = 1 if is_so else 0
-    if tipo in ('win', 'cycle_win'):
-        win_txt = f"✅ WIN  GALE #{gale_num} ({value:.2f}x) 🇺🇲 ${BASE_BET:.2f}"
-        await broadcast(win_txt)
-        if tipo == 'cycle_win':
-            cycle_txt = ("━━━━━━━━━━━━━━━━━━━━━━━\n"
-                         "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
-                         f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
-                         "🔄 _Sesión reiniciada automáticamente_")
-            await broadcast(cycle_txt, parse_mode='Markdown')
-            reset_global_session()
-            await _check_trend_after_cycle()
-        return
-    elif tipo == 'so':
-        g_session.attempt1_result_value = value
-        await _send_so_signal(value)
-        return
-    elif tipo in ('new_col', 'cycle_loss'):
-        r1 = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
-        lost_col = g_session.col - 1 if tipo == 'new_col' else MAX_COLS
+    if tipo == 'win':
+        await broadcast(f"✅ WIN  GALE #{1 if g_session.attempt==1 else 2} ({value:.2f}x) 🇺🇲 ${BASE_BET:.2f}")
+        update_daily_stats(win=True)
+    elif tipo == 'cycle_win':
+        await broadcast(f"✅ WIN  GALE #{1 if g_session.attempt==1 else 2} ({value:.2f}x) 🇺🇲 ${BASE_BET:.2f}")
+        update_daily_stats(win=True)
+        await broadcast(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
+            f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n🔄 _Sesión reiniciada_",
+            parse_mode='Markdown')
+        reset_global_session()
+        await _check_trend_after_cycle()
+    elif tipo == 'new_col':
+        r1       = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
+        lost_col = g_session.col - 1
         col_total = sum(g_session._col_attempt_bets) if g_session._col_attempt_bets else bet
-        g_session._col_attempt_bets = []
-        g_session.attempt1_result_value = 0.0
-        loss_txt = f"❌ LOSS C{lost_col} ({r1} | {value:.2f}x) 🇺🇲 $-{col_total:.2f}"
-        await broadcast(loss_txt)
-        if tipo == 'cycle_loss':
-            cycle_txt = ("━━━━━━━━━━━━━━━━━━━━━━━\n"
-                         "⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
-                         f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
-                         "🔄 _Sesión reiniciada automáticamente_")
-            await broadcast(cycle_txt, parse_mode='Markdown')
-            reset_global_session()
-            await _check_trend_after_cycle()
-        return
-    else:
-        await broadcast(f"Resultado inesperado: {tipo}")
+        g_session._col_attempt_bets        = []
+        g_session.attempt1_result_value    = 0.0
+        await broadcast(f"❌ LOSS C{lost_col} ({r1} | {value:.2f}x) 🇺🇲 $-{col_total:.2f}")
+    elif tipo == 'cycle_loss':
+        r1        = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
+        col_total = sum(g_session._col_attempt_bets) if g_session._col_attempt_bets else bet
+        g_session._col_attempt_bets        = []
+        g_session.attempt1_result_value    = 0.0
+        await broadcast(f"❌ LOSS C{MAX_COLS} ({r1} | {value:.2f}x) 🇺🇲 $-{col_total:.2f}")
+        update_daily_stats(win=False)
+        await broadcast(
+            "━━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
+            f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n🔄 _Sesión reiniciada_",
+            parse_mode='Markdown')
+        reset_global_session()
+        await _check_trend_after_cycle()
+    elif tipo == 'wait_signal':
+        logger.info("Esperando nueva señal Maestro para segunda oportunidad")
 
 async def _check_trend_after_cycle():
     stats = get_quota_stats(200)
     if stats['total'] > 0 and not stats['favorable']:
-        hora = argentina_time()
+        hora  = argentina_time()
         trend = quota_stats_text(stats)
         await broadcast(
             f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
@@ -722,77 +738,42 @@ async def _check_trend_after_cycle():
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
             "⏳ _El bot esperará hasta que la tendencia mejore._\n"
             "_Se notificará automáticamente cuando sea favorable._",
-            parse_mode='Markdown'
-        )
-
-def _confidence_bar(confidence: float) -> str:
-    filled = round(confidence * 10)
-    return f"`[{'█' * filled}{'░' * (10 - filled)}]`"
+            parse_mode='Markdown')
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROCESAMIENTO DE MULTIPLICADORES (NÚCLEO)
+# PROCESAMIENTO DE MULTIPLICADORES — NÚCLEO
 # ─────────────────────────────────────────────────────────────────────────────
 async def process_multiplier(value: float, round_id: str):
-    global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
-    global g_positions, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
-    global g_trend_favorable, g_session, g_last_signal_confidence, g_maestro_results
+    global g_signal_state, g_signal_trigger_mult, g_mults, g_seen_ids
+    global g_trend_favorable, g_session, g_maestro_results
 
-    logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state}/{g_signal_type} (S{g_signal_strictness})")
+    logger.info(f"🎲 {value:.2f}x | ID: {round_id} | Señal: {g_signal_state} | Sesión: {g_session.state}")
 
-    # ────────── 1. Resultado de señal activa (evaluating o so) ──────────
+    # ── 1. Resultado de señal activa ──────────────────────────────────────────
     if g_signal_state == 'evaluating':
         win = value >= WIN_TARGET
-        if g_last_signal_confidence > 0:
-            g_ml_engine.record_signal(g_last_signal_confidence, win)
-            g_last_signal_confidence = 0.0
-
         if g_session.state == GlobalSession.EVALUATING:
             tipo, bet = g_session.on_result(win)
-            await _dispatch_result(value, tipo, bet, is_so=False)
-            g_signal_state = 'so' if g_session.state == GlobalSession.WAITING_SO else 'idle'
-            if g_signal_state != 'so':
-                g_signal_type = None
-                g_signal_strictness = 0
+            await _dispatch_result(value, tipo, bet)
+            if tipo == 'wait_signal':
+                g_signal_state = 'idle'
+            elif tipo in ('new_col', 'cycle_loss', 'cycle_win', 'win'):
+                g_signal_state = 'idle'
         else:
             g_signal_state = 'idle'
-            g_signal_type = None
-            g_signal_strictness = 0
 
-    elif g_signal_state == 'so':
-        win = value >= WIN_TARGET
-        g_signal_state = 'idle'
-        g_signal_type = None
-        g_signal_strictness = 0
-        if g_session.state == GlobalSession.WAITING_SO:
-            tipo, bet = g_session.on_result(win)
-            await _dispatch_result(value, tipo, bet, is_so=True)
-
-    # ────────── 2. Actualizar datos generales y ML ──────────
-    increment = 1 if value >= WIN_TARGET else -1
-    prev = g_positions[-1] if g_positions else 0
-    g_positions.append(prev + increment)
+    # ── 2. Actualizar datos generales ─────────────────────────────────────────
     g_mults.append({'id': round_id, 'value': value, 'ts': time.time()})
-    g_ml_engine.update(value)
-
-    # Actualizar historial Maestro
-    g_maestro_results.insert(0, {'value': value, 'win': value >= WIN_TARGET})
+    g_maestro_results.insert(0, {'id': round_id, 'value': value, 'win': value >= WIN_TARGET})
     if len(g_maestro_results) > MAESTRO_HISTORY_SIZE:
         g_maestro_results.pop()
-
-    # Podar datos si es necesario
     if len(g_mults) >= MAX_MULTS:
         g_mults[:] = g_mults[-TRIM_MULTS:]
-        g_positions[:] = g_positions[-TRIM_MULTS:]
         logger.info(f"✂️ Datos recortados a {TRIM_MULTS} registros")
-
-    g_ema4 = calc_ema(g_positions, 4)
-    g_ema8 = calc_ema(g_positions, 8)
-    g_ema20 = calc_ema(g_positions, 20)
-
     if len(g_seen_ids) > 2000:
         g_seen_ids.clear()
 
-    # ────────── 3. Cambio de tendencia global ──────────
+    # ── 3. Cambio de tendencia global ─────────────────────────────────────────
     stats_trend = get_quota_stats(200)
     if stats_trend['total'] >= 10:
         new_fav = stats_trend['favorable']
@@ -800,76 +781,57 @@ async def process_multiplier(value: float, round_id: str):
             g_trend_favorable = new_fav
             asyncio.create_task(broadcast_trend_change(new_fav))
 
-    # ────────── 4. Detectar nueva señal (combinando estrategias) ──────────
-    if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
-        sig_result = check_moderate_signal()
-        if sig_result:
-            sig_type, strictness = sig_result
-            if strictness >= g_session.col:
-                # Obtener confianza del motor ML
-                ml_data = g_ml_engine.compute_signal_confidence(ema_signal_level=strictness)
-                conf_ml = ml_data['confidence']
+    # ── 4. Detectar nueva señal Maestro (con filtro moderado) ─────────────────
+    if g_signal_state == 'idle':
+        should_enter, confidence, reason = maestro_strategy.should_enter(g_maestro_results)
+        if should_enter:
+            # Bloqueo por tendencia desfavorable (solo columna 1, sesión nueva)
+            if g_session.col == 1 and g_session.state == GlobalSession.IDLE:
+                stats_now = get_quota_stats(200)
+                if stats_now['total'] > 0 and stats_now['favorable'] is False:
+                    logger.info("Señal Maestro bloqueada — tendencia desfavorable")
+                    return
 
-                # Evaluar estrategia Maestro
-                maestro_should, conf_maestro, maestro_reason = maestro_strategy.should_enter(g_maestro_results)
-                maestro_active = USE_MAESTRO_STRATEGY and maestro_should and conf_maestro >= MAESTRO_MIN_CONFIDENCE
-
-                # Decidir si proceder según modo de combinación
-                proceed = False
-                used_strategy = None
-                if SIGNAL_COMBINE_MODE == "OR":
-                    proceed = (conf_ml >= MIN_CONFIDENCE) or maestro_active
-                else:  # AND
-                    proceed = (conf_ml >= MIN_CONFIDENCE) and maestro_active
-
-                # Además, verificar tendencia general (solo si estamos en columna 1)
+            # CASO 1: Primera oportunidad
+            if g_session.state == GlobalSession.IDLE:
+                g_signal_state               = 'evaluating'
+                g_signal_trigger_mult        = value
+                g_session.state              = GlobalSession.EVALUATING
+                g_session.signal_trigger_mult = value
                 if g_session.col == 1:
-                    stats_now = get_quota_stats(200)
-                    trend_ok = (stats_now['total'] == 0) or (stats_now['favorable'] is not False)
-                    proceed = proceed and trend_ok
+                    g_session.start_ficha()
+                await _send_signal(value, reason, is_second_opportunity=False)
+                logger.info(f"🚀 1ª SEÑAL | {value:.2f}x | conf {confidence:.2%} | {reason}")
 
-                if proceed:
-                    # Elegir qué confianza mostrar (la mayor o la combinada)
-                    if maestro_active and conf_maestro > conf_ml:
-                        final_confidence = conf_maestro
-                        used_strategy = "Maestro"
-                    else:
-                        final_confidence = conf_ml
-                        used_strategy = "IA original"
-
-                    g_signal_state = 'evaluating'
-                    g_signal_type = sig_type
-                    g_signal_strictness = strictness
-                    g_signal_trigger_mult = value
-                    g_last_signal_confidence = final_confidence
-                    g_session.signal_trigger_mult = value
-                    g_session.state = GlobalSession.EVALUATING
-
-                    if g_session.col == 1:
-                        g_session.start_ficha()
-
-                    logger.info(f"🚀 SEÑAL S{strictness} Col{g_session.col} | Trigger: {value:.2f}x | "
-                                f"Confianza final: {final_confidence:.2%} | Estrategia: {used_strategy}")
-
-                    maestro_info = {'active': maestro_active, 'reason': maestro_reason} if maestro_active else None
-                    await _send_signal(value, strictness, ml_data, maestro_info)
+            # CASO 2: Segunda oportunidad (esperando nueva señal Maestro)
+            elif g_session.state == GlobalSession.WAITING_SIGNAL and g_session.attempt == 2:
+                g_signal_state               = 'evaluating'
+                g_signal_trigger_mult        = value
+                g_session.state              = GlobalSession.EVALUATING
+                g_session.signal_trigger_mult = value
+                await _send_signal(value, reason, is_second_opportunity=True)
+                logger.info(f"🔄 2ª SEÑAL | {value:.2f}x | apuesta ${g_session.cur_bet:.2f} | {reason}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POLLER HTTPS (Stake Crash API)
+# POLLER HTTPS
 # ─────────────────────────────────────────────────────────────────────────────
 async def http_poller():
     consecutive_errors = 0
-    sleep_next = POLL_INTERVAL_OK
+    sleep_next         = POLL_INTERVAL_OK
     logger.info(f"📡 Iniciando poller HTTP → {API_CRASH}")
     async with aiohttp.ClientSession() as session:
         while True:
             await asyncio.sleep(sleep_next)
             try:
-                ua = random.choice(USER_AGENTS)
+                ua      = random.choice(USER_AGENTS)
                 headers = {'User-Agent': ua, 'Accept': 'application/json', 'Cache-Control': 'no-cache'}
-                g_poller_status['total_requests'] += 1
-                g_poller_status['last_poll_ts'] = time.time()
-                async with session.get(API_CRASH, headers=headers, timeout=aiohttp.ClientTimeout(total=10), ssl=True) as resp:
+                g_poller_status['total_requests']  += 1
+                g_poller_status['last_poll_ts']     = time.time()
+
+                async with session.get(
+                    API_CRASH, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10), ssl=True
+                ) as resp:
                     if resp.status == 429:
                         retry_after = int(resp.headers.get('Retry-After', 30))
                         logger.warning(f"⚠️ Rate limited (429) → esperando {retry_after}s")
@@ -878,140 +840,577 @@ async def http_poller():
                         continue
                     if resp.status >= 500:
                         consecutive_errors += 1
-                        backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
-                        logger.error(f"❌ Error servidor {resp.status} → backoff {backoff:.1f}s")
+                        backoff    = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
                         sleep_next = backoff
+                        logger.error(f"❌ Error servidor {resp.status} → backoff {backoff:.1f}s")
                         continue
                     if resp.status != 200:
                         logger.warning(f"⚠️ Código inesperado: {resp.status}")
                         consecutive_errors += 1
                         sleep_next = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
                         continue
+
                     try:
                         data = await resp.json(content_type=None)
-                    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
-                        logger.warning(f"⚠️ JSON inválido: {e}")
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError):
                         consecutive_errors += 1
                         sleep_next = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
                         continue
-                    api_id = data.get('id')
-                    result = data.get('data', {}).get('result', {})
-                    max_mult = result.get('maxMultiplier')
+
+                    api_id   = data.get('id')
+                    max_mult = data.get('data', {}).get('result', {}).get('maxMultiplier')
                     if not api_id or max_mult is None or max_mult <= 0:
                         consecutive_errors = 0
                         sleep_next = POLL_INTERVAL_OK + random.uniform(0.5, 1.5)
                         continue
+
                     round_id = str(api_id)
                     if round_id in g_seen_ids:
                         consecutive_errors = 0
                         sleep_next = POLL_INTERVAL_OK + random.uniform(0.5, 1.5)
                         continue
+
                     g_seen_ids.add(round_id)
                     g_poller_status['total_new_rounds'] += 1
-                    g_poller_status['last_round_ts'] = time.time()
+                    g_poller_status['last_round_ts']     = time.time()
                     consecutive_errors = 0
                     sleep_next = POLL_INTERVAL_OK + random.uniform(0.3, 1.0)
-                    logger.info(f"🎰 NUEVO GIRO #{g_poller_status['total_new_rounds']} | ID: {round_id} | Multiplicador: {max_mult:.2f}x")
+                    logger.info(f"🎰 NUEVO GIRO #{g_poller_status['total_new_rounds']} | {round_id} | {max_mult:.2f}x")
                     await process_multiplier(float(max_mult), round_id)
+
             except Exception as e:
                 consecutive_errors += 1
-                backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
-                logger.exception(f"💥 Error inesperado: {e} → backoff {backoff:.1f}s")
+                backoff    = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
                 sleep_next = backoff
+                logger.exception(f"💥 Error inesperado: {e} → backoff {backoff:.1f}s")
             finally:
                 g_poller_status['consecutive_errors'] = consecutive_errors
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD WEB (Maestro style)
+# DASHBOARD WEB — Maestro.html unificado (conectado al backend por polling)
 # ─────────────────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
-MAESTRO_HTML = """
-<!DOCTYPE html>
+MAESTRO_HTML = r"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Maestro Crash - Dashboard IA</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maestro Crash - Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Segoe UI', sans-serif; background: #0a0e17; color: #fff; padding: 16px; }
-  .container { max-width: 800px; margin: 0 auto; }
-  .card { background: rgba(255,255,255,0.04); border-radius: 12px; padding: 14px; margin-bottom: 14px; border: 1px solid rgba(255,255,255,0.06); }
-  .prediction { border-left: 3px solid #a855f7; }
-  .stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; text-align: center; }
-  .stat-value { font-size: 20px; font-weight: bold; font-family: monospace; }
-  .result-pill { display: inline-block; padding: 4px 8px; border-radius: 6px; margin: 2px; font-family: monospace; background: rgba(255,255,255,0.05); }
-  .result-pill.latest { background: #a855f7; color: white; }
-  .chart-container { height: 250px; margin: 12px 0; }
-  .level-row { display: flex; justify-content: space-between; margin: 12px 0; }
-  .level { text-align: center; }
-  .level-label { font-size: 11px; color: #aaa; }
-  .level-value { font-size: 18px; font-weight: bold; }
-  .support { color: #10b981; }
-  .resistance { color: #ef4444; }
-  button { background: #a855f7; border: none; padding: 8px 16px; border-radius: 8px; color: white; cursor: pointer; margin-top: 8px; }
-  .status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #22c55e; margin-right: 6px; animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.5} }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'Segoe UI', Roboto, sans-serif;
+  min-height: 100vh; background: #0a0e17; color: #fff; overflow-x: hidden;
+}
+body::before {
+  content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background:
+    radial-gradient(ellipse at 20% 50%, rgba(168,85,247,0.12), transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(59,130,246,0.10), transparent 50%),
+    radial-gradient(ellipse at 50% 80%, rgba(16,185,129,0.08), transparent 50%);
+  animation: bgShift 12s ease-in-out infinite alternate; z-index: -2;
+}
+body::after {
+  content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background-image:
+    radial-gradient(1px 1px at 10% 20%, rgba(255,255,255,0.4), transparent),
+    radial-gradient(1px 1px at 30% 60%, rgba(255,255,255,0.3), transparent),
+    radial-gradient(1px 1px at 50% 10%, rgba(255,255,255,0.35), transparent),
+    radial-gradient(1px 1px at 70% 80%, rgba(255,255,255,0.25), transparent),
+    radial-gradient(1px 1px at 90% 40%, rgba(255,255,255,0.3), transparent);
+  background-size: 250px 250px; animation: stars 6s linear infinite; opacity: 0.3; z-index: -1;
+}
+@keyframes stars { from{transform:translateY(0)} to{transform:translateY(-250px)} }
+@keyframes bgShift { 0%{filter:hue-rotate(0deg)} 100%{filter:hue-rotate(20deg)} }
+
+.container { max-width: 640px; margin: 0 auto; padding: 16px; }
+.header { text-align: center; padding: 16px 0 10px; }
+.header h1 {
+  font-size: 22px; font-weight: 700;
+  background: linear-gradient(135deg,#a855f7,#3b82f6,#10b981);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  margin-bottom: 4px;
+}
+.badge {
+  display: inline-block; background: linear-gradient(135deg,#a855f7,#6366f1);
+  color:#fff; font-size:10px; font-weight:700; padding:2px 8px;
+  border-radius:10px; letter-spacing:1px; vertical-align:middle; margin-left:6px;
+}
+.subtitle { font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 4px; }
+
+.status-bar {
+  display:flex; justify-content:space-between; align-items:center;
+  padding:10px 14px; background:rgba(255,255,255,0.04);
+  border-radius:10px; border:1px solid rgba(255,255,255,0.06); margin-bottom:12px;
+}
+.status-indicator { display:flex; align-items:center; gap:6px; }
+.status-dot {
+  width:7px; height:7px; border-radius:50%; background:#ef4444; transition:background 0.3s;
+}
+.status-dot.connected { background:#22c55e; box-shadow:0 0 6px #22c55e; animation:pulseG 2s infinite; }
+.status-dot.waiting   { background:#f59e0b; animation:pulseY 1s infinite; }
+@keyframes pulseG { 0%,100%{opacity:1}50%{opacity:.5} }
+@keyframes pulseY { 0%,100%{opacity:1}50%{opacity:.3} }
+.status-text { font-size:11px; color:rgba(255,255,255,0.6); }
+#clock { font-family:'Courier New',monospace; font-size:13px; color:rgba(255,255,255,0.6); }
+
+/* Señal activa */
+.signal-banner {
+  display:none; padding:12px 14px; border-radius:10px; margin-bottom:12px;
+  background:rgba(168,85,247,0.12); border:1px solid rgba(168,85,247,0.4);
+  animation:signalPulse 1.5s ease-in-out infinite;
+}
+.signal-banner.show { display:block; }
+@keyframes signalPulse { 0%,100%{box-shadow:0 0 0 rgba(168,85,247,0)} 50%{box-shadow:0 0 18px rgba(168,85,247,0.4)} }
+.signal-title { font-size:13px; font-weight:700; color:#c084fc; margin-bottom:4px; }
+.signal-detail { font-size:11px; color:rgba(255,255,255,0.6); }
+
+/* Prediction Card */
+.prediction-card {
+  background:rgba(255,255,255,0.03); border-radius:12px; padding:14px;
+  margin-bottom:14px; border:1px solid rgba(255,255,255,0.06);
+  transition:all 0.4s ease; position:relative; overflow:hidden;
+}
+.prediction-card::before {
+  content:''; position:absolute; top:0; left:0; width:100%; height:3px;
+  background:rgba(255,255,255,0.1); transition:background 0.4s;
+}
+.prediction-card[data-risk="low"]    { border-color:rgba(16,185,129,0.3);  box-shadow:0 0 20px rgba(16,185,129,0.08); }
+.prediction-card[data-risk="low"]::before { background:linear-gradient(90deg,#10b981,#34d399); }
+.prediction-card[data-risk="medium"] { border-color:rgba(245,158,11,0.3);  box-shadow:0 0 20px rgba(245,158,11,0.08); }
+.prediction-card[data-risk="medium"]::before { background:linear-gradient(90deg,#f59e0b,#fbbf24); }
+.prediction-card[data-risk="high"]   { border-color:rgba(239,68,68,0.3);   box-shadow:0 0 20px rgba(239,68,68,0.08); }
+.prediction-card[data-risk="high"]::before { background:linear-gradient(90deg,#ef4444,#f87171); }
+.prediction-card[data-risk="wait"]   { border-color:rgba(100,116,139,0.2); }
+.prediction-card[data-risk="wait"]::before { background:rgba(100,116,139,0.4); }
+.prediction-label  { font-size:10px; color:rgba(255,255,255,0.4); text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px; }
+.prediction-text   { font-size:15px; font-weight:600; color:#fff; line-height:1.4; }
+.prediction-detail { font-size:11px; color:rgba(255,255,255,0.45); margin-top:5px; }
+.confidence-bar    { margin-top:8px; background:rgba(255,255,255,0.07); border-radius:4px; height:4px; overflow:hidden; }
+.confidence-fill   { height:100%; background:linear-gradient(90deg,#a855f7,#10b981); border-radius:4px; transition:width 0.5s; }
+
+/* Chart tabs */
+.chart-tabs { display:flex; gap:6px; margin-bottom:10px; }
+.chart-tab {
+  flex:1; padding:8px; background:rgba(255,255,255,0.03);
+  border:1px solid rgba(255,255,255,0.06); border-radius:8px;
+  color:rgba(255,255,255,0.5); font-size:11px; font-weight:600;
+  text-align:center; cursor:pointer; transition:all 0.2s;
+}
+.chart-tab.active { background:rgba(168,85,247,0.12); border-color:rgba(168,85,247,0.3); color:#c084fc; }
+
+/* Chart */
+.chart-container {
+  position:relative; width:100%; height:260px;
+  background:rgba(255,255,255,0.02); border-radius:12px;
+  border:1px solid rgba(255,255,255,0.05); margin-bottom:14px; overflow:hidden;
+}
+.chart-container canvas { position:absolute; top:0; left:0; width:100%!important; height:100%!important; }
+#lineChartCanvas { opacity:0; transition:opacity 0.4s; pointer-events:none; }
+#lineChartCanvas.active { opacity:1; pointer-events:auto; }
+
+/* Results */
+.results-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+.results-header h3 { font-size:12px; color:rgba(255,255,255,0.5); font-weight:500; }
+.round-info { font-size:11px; color:rgba(255,255,255,0.3); font-family:monospace; }
+.results-container {
+  display:flex; gap:5px; overflow-x:auto; padding:8px 0;
+  scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.1) transparent;
+}
+.results-container::-webkit-scrollbar { height:3px; }
+.results-container::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:3px; }
+.result-pill {
+  flex-shrink:0; padding:6px 10px; border-radius:6px; font-size:13px; font-weight:600;
+  background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.06);
+  font-family:'Courier New',monospace; min-width:52px; text-align:center; transition:all 0.3s;
+}
+.result-pill.latest { animation:latestPulse 1.5s infinite; font-weight:700; border-width:1.5px; }
+.result-pill.latest.positive { background:rgba(16,185,129,0.12); border-color:rgba(16,185,129,0.4); color:#34d399; }
+.result-pill.latest.negative { background:rgba(239,68,68,0.12);  border-color:rgba(239,68,68,0.4);  color:#f87171; }
+.result-pill.latest.high     { background:rgba(245,158,11,0.15); border-color:rgba(245,158,11,0.5); color:#fbbf24; }
+.result-pill.cat-low  { color:#f87171; }
+.result-pill.cat-mid  { color:#60a5fa; }
+.result-pill.cat-good { color:#34d399; }
+.result-pill.cat-high { color:#f472b6; }
+.result-pill.cat-vhigh{ color:#c084fc; }
+@keyframes latestPulse { 0%,100%{filter:brightness(1)} 50%{filter:brightness(1.2)} }
+
+/* Levels */
+.levels-row { display:flex; justify-content:space-around; padding:10px 0; margin-top:8px; }
+.level-item { text-align:center; }
+.level-label { font-size:9px; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px; }
+.level-label.support { color:#22c55e; } .level-label.resistance { color:#ef4444; }
+.level-value { font-size:14px; font-weight:700; font-family:'Courier New',monospace; }
+.level-value.support { color:#4ade80; } .level-value.resistance { color:#f87171; }
+
+/* Stats */
+.stats-grid {
+  display:grid; grid-template-columns:repeat(3,1fr); gap:8px;
+  margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.05);
+}
+.stat-box { text-align:center; padding:10px 6px; background:rgba(255,255,255,0.02); border-radius:8px; border:1px solid rgba(255,255,255,0.04); }
+.stat-label { font-size:9px; color:rgba(255,255,255,0.35); text-transform:uppercase; letter-spacing:0.8px; margin-bottom:4px; }
+.stat-value { font-size:15px; font-weight:700; font-family:'Courier New',monospace; }
+.stat-value.green { color:#34d399; } .stat-value.red { color:#f87171; }
+.stat-value.blue  { color:#60a5fa; } .stat-value.gold { color:#fbbf24; }
+
+/* Marcador */
+.marcador {
+  display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px;
+  padding:12px; background:rgba(255,255,255,0.02); border-radius:10px;
+  border:1px solid rgba(255,255,255,0.06);
+}
+.marc-item { text-align:center; }
+.marc-label { font-size:9px; color:rgba(255,255,255,0.35); text-transform:uppercase; letter-spacing:0.8px; }
+.marc-value { font-size:18px; font-weight:700; font-family:'Courier New',monospace; margin-top:2px; }
+
+.footer { text-align:center; padding:18px 0 10px; font-size:10px; color:rgba(255,255,255,0.2); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 <div class="container">
-  <h2>📡 Maestro Crash Tracker <span style="font-size:12px;">(integración IA)</span></h2>
-  <div class="card prediction" id="predictionCard">
-    <div><span class="status"></span> <span id="predictionText">Cargando...</span></div>
-    <div id="predictionDetail" style="font-size:12px;color:#aaa;"></div>
+
+  <div class="header">
+    <h1>Maestro Crash <span class="badge">LIVE</span></h1>
+    <div class="subtitle">Stake Crash · Bot Automático</div>
   </div>
-  <div class="level-row">
-    <div class="level"><div class="level-label">Soporte</div><div class="level-value support" id="support">-</div></div>
-    <div class="level"><div class="level-label">Resistencia</div><div class="level-value resistance" id="resistance">-</div></div>
+
+  <div class="status-bar">
+    <div class="status-indicator">
+      <div class="status-dot waiting" id="status-dot"></div>
+      <span class="status-text" id="status-text">CONECTANDO...</span>
+    </div>
+    <div id="clock"></div>
   </div>
-  <div class="stats">
-    <div><div>Promedio</div><div class="stat-value" id="avg">-</div></div>
-    <div><div>Máximo</div><div class="stat-value" id="max">-</div></div>
-    <div><div>Verdes %</div><div class="stat-value" id="greenPct">-</div></div>
+
+  <!-- Señal activa -->
+  <div class="signal-banner" id="signalBanner">
+    <div class="signal-title" id="signalTitle">💎 Señal activa</div>
+    <div class="signal-detail" id="signalDetail">—</div>
   </div>
-  <div class="chart-container"><canvas id="trendChart"></canvas></div>
-  <div id="resultsList" style="margin-top: 12px;"></div>
-  <button onclick="location.reload()">Actualizar</button>
+
+  <!-- Prediction -->
+  <div class="prediction-card" id="prediction" data-risk="wait">
+    <div class="prediction-label">Análisis Maestro</div>
+    <div class="prediction-text" id="predText">Cargando datos...</div>
+    <div class="prediction-detail" id="predDetail">Esperando resultados del juego</div>
+    <div class="confidence-bar"><div class="confidence-fill" id="confFill" style="width:0%"></div></div>
+  </div>
+
+  <!-- Chart tabs -->
+  <div class="chart-tabs">
+    <button class="chart-tab active" data-type="line" id="tabLine">Tendencia</button>
+    <button class="chart-tab" data-type="bar" id="tabBar">Barras</button>
+  </div>
+
+  <!-- Charts -->
+  <div class="chart-container">
+    <canvas id="lineChartCanvas" class="active"></canvas>
+    <canvas id="barChartCanvas"></canvas>
+  </div>
+
+  <!-- Results -->
+  <div class="results-header">
+    <h3>Últimos Multiplicadores</h3>
+    <span class="round-info" id="roundInfo">Ronda #0</span>
+  </div>
+  <div class="results-container" id="results"></div>
+
+  <!-- Levels -->
+  <div class="levels-row">
+    <div class="level-item">
+      <div class="level-label support">Soporte</div>
+      <div class="level-value support" id="support-val">—</div>
+    </div>
+    <div class="level-item">
+      <div class="level-label resistance">Resistencia</div>
+      <div class="level-value resistance" id="resistance-val">—</div>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="stat-label">Promedio</div>
+      <div class="stat-value blue" id="stat-avg">0.00x</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Más Alto</div>
+      <div class="stat-value gold" id="stat-high">0.00x</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Verdes %</div>
+      <div class="stat-value green" id="stat-green">0%</div>
+    </div>
+  </div>
+
+  <!-- Marcador diario -->
+  <div class="marcador">
+    <div class="marc-item">
+      <div class="marc-label">✅ Ganadas</div>
+      <div class="marc-value" style="color:#34d399" id="marc-wins">0</div>
+    </div>
+    <div class="marc-item">
+      <div class="marc-label">❌ Perdidas</div>
+      <div class="marc-value" style="color:#f87171" id="marc-losses">0</div>
+    </div>
+  </div>
+
+  <div class="footer">Maestro Crash Bot &bull; Stake &bull; Auto Mode</div>
 </div>
+
 <script>
-  let chart;
-  async function fetchData() {
-    try {
-      const res = await fetch('/api/maestro_data');
-      const data = await res.json();
-      document.getElementById('predictionText').innerText = data.prediction;
-      document.getElementById('predictionDetail').innerText = data.detail;
-      document.getElementById('support').innerText = data.support !== null ? data.support.toFixed(2)+'x' : '-';
-      document.getElementById('resistance').innerText = data.resistance !== null ? data.resistance.toFixed(2)+'x' : '-';
-      document.getElementById('avg').innerText = data.avg.toFixed(2)+'x';
-      document.getElementById('max').innerText = data.max.toFixed(2)+'x';
-      document.getElementById('greenPct').innerText = data.green_pct+'%';
-      const container = document.getElementById('resultsList');
-      container.innerHTML = data.results.map((r,i) => `<span class="result-pill ${i===0?'latest':''}">${r.value.toFixed(2)}x</span>`).join('');
-      if (chart) chart.destroy();
-      const ctx = document.getElementById('trendChart').getContext('2d');
-      chart = new Chart(ctx, {
-        type: 'line',
-        data: { labels: data.chart_labels, datasets: [{ label: 'Multiplicador', data: data.chart_values, borderColor: '#a855f7', tension: 0.1, fill: true, backgroundColor: 'rgba(168,85,247,0.1)' }] },
-        options: { responsive: true, maintainAspectRatio: true }
-      });
-    } catch(e) { console.error(e); }
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const WIN_TARGET = 2.00;
+const POLL_MS    = 3000;
+
+// ─── STATE ─────────────────────────────────────────────────────────────────
+let localResults    = [];   // [{id, value, win}] más nuevo primero
+let lastKnownId     = null;
+let roundCount      = 0;
+let highestMult     = 0;
+let cumulativeScore = 0;
+
+let lineChart, barChart;
+
+// ─── CLOCK ─────────────────────────────────────────────────────────────────
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    String(now.getHours()).padStart(2,'0') + ':' +
+    String(now.getMinutes()).padStart(2,'0') + ':' +
+    String(now.getSeconds()).padStart(2,'0');
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ─── STATUS ────────────────────────────────────────────────────────────────
+function setStatus(s) {
+  const dot  = document.getElementById('status-dot');
+  const text = document.getElementById('status-text');
+  dot.className  = 'status-dot ' + s;
+  text.textContent = s === 'connected' ? 'EN VIVO' : s === 'waiting' ? 'ESPERANDO...' : 'DESCONECTADO';
+}
+
+// ─── HELPERS ────────────────────────────────────────────────────────────────
+function getCategory(v) {
+  if (v < 1.50) return 'low';
+  if (v < 2.00) return 'mid';
+  if (v < 3.00) return 'good';
+  if (v < 10.0) return 'high';
+  return 'vhigh';
+}
+
+// ─── CHARTS ─────────────────────────────────────────────────────────────────
+function initCharts() {
+  const lineCtx = document.getElementById('lineChartCanvas').getContext('2d');
+  lineChart = new Chart(lineCtx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Score acumulado',
+        data: [],
+        borderColor: '#a855f7',
+        borderWidth: 2,
+        fill: { target: 'origin', above: 'rgba(16,185,129,0.06)', below: 'rgba(239,68,68,0.06)' },
+        pointRadius: 0,
+        tension: 0.2,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: 'rgba(255,255,255,0.3)', font: { size: 9 } } }
+      }
+    }
+  });
+
+  const barCtx = document.getElementById('barChartCanvas').getContext('2d');
+  barChart = new Chart(barCtx, {
+    type: 'bar',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Multiplicador',
+        data: [],
+        backgroundColor: [],
+        borderRadius: 3,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { display: false },
+        y: {
+          grid: { color: 'rgba(255,255,255,0.04)' },
+          ticks: { color: 'rgba(255,255,255,0.3)', font: { size: 9 } },
+          min: 0
+        }
+      }
+    }
+  });
+}
+
+function updateCharts() {
+  const pts    = localResults.slice(0, 30).reverse();
+  const labels = pts.map((_, i) => i);
+  const vals   = pts.map(r => parseFloat(r.value));
+  const colors = vals.map(v => v >= WIN_TARGET ? 'rgba(16,185,129,0.6)' : 'rgba(239,68,68,0.5)');
+
+  // Line chart (cumulative score)
+  let cum = 0, cumData = [];
+  for (const v of vals) { cum += v >= WIN_TARGET ? 1 : -1; cumData.push(cum); }
+  lineChart.data.labels                        = labels;
+  lineChart.data.datasets[0].data             = cumData;
+  lineChart.update('none');
+
+  // Bar chart
+  barChart.data.labels                             = labels;
+  barChart.data.datasets[0].data                  = vals;
+  barChart.data.datasets[0].backgroundColor       = colors;
+  barChart.update('none');
+}
+
+// ─── RESULTS DISPLAY ────────────────────────────────────────────────────────
+function updateResultsDisplay() {
+  const container = document.getElementById('results');
+  container.innerHTML = '';
+  localResults.forEach((item, i) => {
+    const pill  = document.createElement('div');
+    const v     = parseFloat(item.value);
+    pill.className = `result-pill cat-${getCategory(v)}`;
+    if (i === 0) {
+      pill.classList.add('latest');
+      if (v >= 5)       pill.classList.add('high');
+      else if (v >= 2)  pill.classList.add('positive');
+      else              pill.classList.add('negative');
+    }
+    pill.textContent = v.toFixed(2) + 'x';
+    container.appendChild(pill);
+  });
+  document.getElementById('roundInfo').textContent = `Ronda #${roundCount}`;
+}
+
+// ─── PREDICTION UI ──────────────────────────────────────────────────────────
+function updatePredictionUI(data) {
+  const card = document.getElementById('prediction');
+  card.setAttribute('data-risk', data.risk || 'wait');
+  document.getElementById('predText').textContent   = data.prediction   || '—';
+  document.getElementById('predDetail').textContent = data.detail       || '—';
+  const conf = Math.round((data.confidence || 0) * 100);
+  document.getElementById('confFill').style.width   = conf + '%';
+
+  // Support / Resistance
+  document.getElementById('support-val').textContent    = data.support    != null ? data.support.toFixed(2)    + 'x' : '—';
+  document.getElementById('resistance-val').textContent = data.resistance != null ? data.resistance.toFixed(2) + 'x' : '—';
+}
+
+// ─── STATS UI ───────────────────────────────────────────────────────────────
+function updateStatsUI(data) {
+  document.getElementById('stat-avg').textContent   = (data.avg   || 0).toFixed(2) + 'x';
+  document.getElementById('stat-high').textContent  = (data.max   || 0).toFixed(2) + 'x';
+  const pct = data.green_pct || 0;
+  const el  = document.getElementById('stat-green');
+  el.textContent = pct.toFixed(0) + '%';
+  el.className   = 'stat-value ' + (pct >= 50 ? 'green' : 'red');
+
+  document.getElementById('marc-wins').textContent   = data.daily_wins   || 0;
+  document.getElementById('marc-losses').textContent = data.daily_losses || 0;
+}
+
+// ─── SIGNAL BANNER ──────────────────────────────────────────────────────────
+function updateSignalBanner(data) {
+  const banner = document.getElementById('signalBanner');
+  if (data.signal_active) {
+    banner.classList.add('show');
+    document.getElementById('signalTitle').textContent  = `💎 Señal activa — C${data.signal_col || 1} Int.${data.signal_attempt || 1}/${data.max_attempts || 2}`;
+    document.getElementById('signalDetail').textContent = `Trigger: ${(data.signal_trigger || 0).toFixed(2)}x | Apuesta: $${(data.signal_bet || 0).toFixed(2)}`;
+  } else {
+    banner.classList.remove('show');
   }
-  fetchData();
-  setInterval(fetchData, 3000);
+}
+
+// ─── MAIN POLL LOOP ─────────────────────────────────────────────────────────
+async function poll() {
+  try {
+    const res  = await fetch('/api/maestro_data');
+    const data = await res.json();
+
+    if (data.results && data.results.length > 0) {
+      const apiResults = data.results;
+      const latestId   = apiResults[0].id;
+
+      if (latestId !== lastKnownId) {
+        // Detectar cuántos resultados nuevos hay
+        const prevIdx = lastKnownId != null
+          ? apiResults.findIndex(r => r.id === lastKnownId)
+          : -1;
+        const newCount = prevIdx === -1 ? apiResults.length : prevIdx;
+
+        // Actualizar lista local (completa desde API)
+        localResults = apiResults;
+        roundCount  += newCount;
+        if (apiResults[0].value > highestMult) highestMult = apiResults[0].value;
+        lastKnownId  = latestId;
+
+        updateResultsDisplay();
+        updateCharts();
+        setStatus('connected');
+      }
+
+      updatePredictionUI(data);
+      updateStatsUI(data);
+      updateSignalBanner(data);
+    }
+  } catch(e) {
+    setStatus('disconnected');
+  }
+  setTimeout(poll, POLL_MS);
+}
+
+// ─── CHART TABS ─────────────────────────────────────────────────────────────
+document.querySelectorAll('.chart-tab').forEach(tab => {
+  tab.addEventListener('click', e => {
+    document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
+    e.target.classList.add('active');
+    const isLine = e.target.dataset.type === 'line';
+    document.getElementById('lineChartCanvas').classList.toggle('active', isLine);
+    document.getElementById('barChartCanvas').style.display  = isLine ? 'none' : 'block';
+    document.getElementById('lineChartCanvas').style.display = isLine ? 'block' : 'none';
+  });
+});
+
+// ─── INIT ────────────────────────────────────────────────────────────────────
+initCharts();
+// barChart oculto por defecto
+document.getElementById('barChartCanvas').style.display = 'none';
+setStatus('waiting');
+poll();
 </script>
 </body>
 </html>
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RUTAS FLASK
+# ─────────────────────────────────────────────────────────────────────────────
 @flask_app.route('/')
 def home():
-    last_round_ago = f"{int(time.time() - g_poller_status['last_round_ts'])}s atrás" if g_poller_status['last_round_ts'] else "sin datos"
-    ml = g_ml_engine.get_market_reading()
-    return f"🤖 CrashBot IA v4.0 ACTIVO | Datos: {len(g_mults)}/400 | Señal: {g_signal_state} | Giros: {g_poller_status['total_new_rounds']} | ML: {ml['state']} ({ml['win_prob_pct']}%)", 200
+    elapsed = f"{int(time.time()-g_poller_status['last_round_ts'])}s" if g_poller_status['last_round_ts'] else "—"
+    return (
+        f"🤖 CrashBot Maestro ACTIVO | "
+        f"Datos: {len(g_mults)}/400 | Señal: {g_signal_state} | "
+        f"Giros: {g_poller_status['total_new_rounds']} | Último: {elapsed}"
+    ), 200
 
 @flask_app.route('/ping')
 def ping():
@@ -1023,28 +1422,52 @@ def maestro_dashboard():
 
 @flask_app.route('/api/maestro_data')
 def api_maestro_data():
-    # Preparar datos para el dashboard
-    results = g_maestro_results[:30]  # últimos 30
-    values = [r['value'] for r in results]
-    if values:
-        avg = sum(values) / len(values)
-        max_val = max(values)
-        green_pct = sum(1 for v in values if v >= WIN_TARGET) / len(values) * 100
-    else:
-        avg = max_val = green_pct = 0.0
+    results = g_maestro_results[:50]
+    values  = [r['value'] for r in results]
+
+    avg       = sum(values) / len(values) if values else 0.0
+    max_val   = max(values)              if values else 0.0
+    green_pct = sum(1 for v in values if v >= WIN_TARGET) / len(values) * 100 if values else 0.0
+
     trend = maestro_strategy.analyze_trend(results)
-    sr = maestro_strategy.calculate_support_resistance(results)
+    sr    = maestro_strategy.calculate_support_resistance(results)
+
+    reset_daily_if_needed()
+
     return jsonify({
+        # Resultados para el dashboard
+        'results': [{'id': r['id'], 'value': r['value'], 'win': r['win']} for r in results],
+
+        # Predicción
         'prediction': trend['prediction'],
-        'detail': trend['detail'],
-        'support': sr['support'],
+        'detail':     trend['detail'],
+        'risk':       trend['risk'],
+        'confidence': trend['confidence'],
+
+        # Niveles
+        'support':    sr['support'],
         'resistance': sr['resistance'],
-        'avg': avg,
-        'max': max_val,
+
+        # Stats
+        'avg':       avg,
+        'max':       max_val,
         'green_pct': round(green_pct, 1),
-        'results': [{'value': r['value']} for r in results],
-        'chart_values': values[::-1],   # orden cronológico para gráfico
-        'chart_labels': list(range(len(values))),
+
+        # Marcador diario
+        'daily_wins':   daily_stats['wins'],
+        'daily_losses': daily_stats['losses'],
+
+        # Estado de señal activa
+        'signal_active':  g_signal_state == 'evaluating',
+        'signal_trigger': g_signal_trigger_mult,
+        'signal_col':     g_session.col,
+        'signal_attempt': g_session.attempt,
+        'signal_bet':     g_session.cur_bet,
+        'max_attempts':   MAX_ATTS,
+
+        # Poller status
+        'total_rounds':  g_poller_status['total_new_rounds'],
+        'data_count':    len(g_mults),
     })
 
 def run_flask():
@@ -1052,143 +1475,91 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELF-PING (para mantener Render activo)
+# SELF-PING (Render keep-alive)
 # ─────────────────────────────────────────────────────────────────────────────
 async def self_ping_loop():
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
     if not render_url:
-        logger.info("RENDER_EXTERNAL_URL no configurada — self-ping desactivado")
         return
     url = f"{render_url.rstrip('/')}/ping"
-    logger.info(f"Self-ping cada 14 min → {url}")
     while True:
         await asyncio.sleep(14 * 60)
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    logger.info(f"Self-ping OK: {r.status}")
-        except Exception as e:
-            logger.warning(f"Self-ping falló: {e}")
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)):
+                    pass
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HANDLERS DE TELEGRAM
+# HANDLERS TELEGRAM
 # ─────────────────────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start'])
 async def cmd_start(message):
-    name = message.from_user.first_name or "usuario"
-    stats = get_quota_stats(200)
-    stats_blk = quota_stats_text(stats)
-    data_info = f"📡 `{len(g_mults)}/400` multiplicadores recopilados" if g_mults else "📡 Recopilando datos..."
+    name       = message.from_user.first_name or "usuario"
+    stats      = get_quota_stats(200)
+    stats_blk  = quota_stats_text(stats)
+    data_info  = f"📡 `{len(g_mults)}/400` multiplicadores recopilados" if g_mults else "📡 Recopilando datos..."
     await bot.reply_to(message,
         f"🚀 *¡Bienvenido {name}!*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 *Bot de Señales Crash (Stake) — IA v4.0*\n"
-        "📊 Estrategias: IA Bayesiana + Markov + Maestro (rachas)\n"
+        "🎭 *Bot de Señales Crash — Estrategia Maestro + Filtro Moderado*\n"
+        "📊 Análisis de rachas + EMAs | Detección de zonas de entrada\n"
         f"🎯 Objetivo: `{WIN_TARGET:.2f}x` | Gestión: 3C×2I\n"
-        f"💵 Apuesta base: `${BASE_BET:.2f}`\n"
-        f"🧠 Umbral IA: `{MIN_CONFIDENCE*100:.0f}%` | Maestro: `{MAESTRO_MIN_CONFIDENCE*100:.0f}%`\n"
+        f"💰 Apuesta base: `${BASE_BET:.2f}`\n"
+        f"🧠 Confianza mínima: `{MAESTRO_MIN_CONFIDENCE*100:.0f}%` | Solo señales `risk=low` + alerta moderada\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📢 *Señales en el canal oficial*\n"
-        "🤖 *Comandos:* /estadisticas /ia /mercado /maestro\n"
+        "🤖 *Comandos:* /señal /estadisticas /tendencia\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{data_info}\n\n{stats_blk}",
         parse_mode='Markdown')
 
-@bot.message_handler(commands=['ia'])
-async def cmd_ia(message):
-    ml = g_ml_engine.compute_signal_confidence(1)
-    perf = g_ml_engine.performance_stats()
-    conf_bar = _confidence_bar(ml['confidence'])
-    markov_line = f"🔗 Markov P(ganar): `{ml['markov_pct']}%`\n" if ml['markov_pct'] else "🔗 Markov: _acumulando..._\n"
-    perf_block = ""
-    if perf['total'] > 0:
-        perf_block = (f"━━━━━━━━━━━━━━━━━━━━━━━\n📋 *Calibración del Modelo*\n"
-                      f"📌 Señales: `{perf['total']}` | Precisión: `{perf['accuracy']}%`\n"
-                      f"🎯 Confianza promedio: `{perf['avg_conf']}%`\n")
-        if perf['high_conf_acc']:
-            perf_block += f"💎 Alta confianza (≥65%): `{perf['high_conf_acc']}%` en `{perf['high_total']}` señales\n"
-    else:
-        perf_block = "━━━━━━━━━━━━━━━━━━━━━━━\n📋 _Sin señales registradas aún._\n"
-    await bot.reply_to(message,
-        "🤖 *ANÁLISIS IA (Bayes+Markov)*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🧠 *Confianza actual: `{ml['pct']}%`* {ml['recommendation']}\n{conf_bar}\n"
-        f"📐 Bayes: `{ml['bayes_pct']}%`\n{markov_line}"
-        f"📊 Volatilidad: `{ml['volatility_pct']}%` | Riesgo patrón: `{ml['loss_risk_pct']}%`\n"
-        f"📉 Ajuste racha: `{ml['streak']['prob_boost']:+.1%}`\n"
-        f"🎯 Umbral IA: `{MIN_CONFIDENCE*100:.0f}%` → {'✅ APRUEBA' if ml['confidence']>=MIN_CONFIDENCE else '⛔ BLOQUEA'}\n"
-        f"{perf_block}",
-        parse_mode='Markdown')
-
-@bot.message_handler(commands=['mercado'])
-async def cmd_mercado(message):
-    mr = g_ml_engine.get_market_reading()
-    hora = argentina_time()
-    markov_line = f"🔗 Markov: `{mr['markov_pct']}%`\n" if mr['markov_pct'] else "🔗 Markov: _acumulando..._\n"
-    streak = mr['streak']
-    s_emoji = "📉" if streak['type'] == 'loss_streak' else "📈"
-    await bot.reply_to(message,
-        f"📡 *ESTADO MERCADO CRASH — {hora}*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌐 Estado general: *{mr['state']}*\n"
-        f"🎯 P(≥{WIN_TARGET:.2f}x): `{mr['win_prob_pct']}%`\n{markov_line}"
-        f"📊 Volatilidad: `{mr['volatility_pct']}%` | Riesgo patrón: `{mr['loss_risk_pct']}%`\n"
-        f"{s_emoji} Racha: `{streak['length']} {'pérdidas' if streak['type']=='loss_streak' else 'victorias'}`\n"
-        f"📈 Últimas 20: Prom `{mr['avg']}x` | Mediana `{mr['median']}x` | Máx `{mr['max_r']}x`\n"
-        f"🔢 Procesados: `{mr['total_processed']}` | Estados Markov: `{mr['markov_states']}`",
-        parse_mode='Markdown')
-
-@bot.message_handler(commands=['maestro'])
-async def cmd_maestro(message):
-    """Muestra la última predicción de la estrategia Maestro."""
+@bot.message_handler(commands=['señal'])
+async def cmd_signal(message):
     if not g_maestro_results:
-        await bot.reply_to(message, "📡 *Estrategia Maestro*: Aún no hay suficientes datos. Esperando multiplicadores...", parse_mode='Markdown')
+        await bot.reply_to(message, "📡 *Maestro*: Aún no hay suficientes datos.", parse_mode='Markdown')
         return
-    trend = maestro_strategy.analyze_trend(g_maestro_results)
-    sr = maestro_strategy.calculate_support_resistance(g_maestro_results)
+    trend        = maestro_strategy.analyze_trend(g_maestro_results)
     should, conf, reason = maestro_strategy.should_enter(g_maestro_results)
+    sr           = maestro_strategy.calculate_support_resistance(g_maestro_results)
+    status_text  = "✅ SEÑAL ACTIVA (risk=low + moderado)" if should else "❌ Sin señal ahora"
+    support_txt  = f"🟢 Soporte: `{sr['support']:.2f}x`"    if sr['support']    else "🟢 Soporte: `—`"
+    resist_txt   = f"🔴 Resistencia: `{sr['resistance']:.2f}x`" if sr['resistance'] else "🔴 Resistencia: `—`"
     await bot.reply_to(message,
-        f"🎭 *Estrategia Maestro* (adaptada a Crash {WIN_TARGET:.2f}x)\n"
+        f"🎭 *Estrategia Maestro + Filtro Moderado* (objetivo ≥ {WIN_TARGET:.2f}x)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Predicción: `{trend['prediction']}`\n"
         f"📝 Detalle: {trend['detail']}\n"
-        f"🎯 Confianza: `{conf*100:.1f}%` (umbral {MAESTRO_MIN_CONFIDENCE*100:.0f}%)\n"
-        f"🚦 Señal actual: {'✅ ACTIVA' if should else '❌ INACTIVA'}\n"
+        f"🎯 Confianza: `{conf*100:.1f}%`\n"
+        f"🚦 Estado: {status_text}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Soporte: {sr['support']:.2f}x" if sr['support'] else "🟢 Soporte: -" + "\n"
-        f"🔴 Resistencia: {sr['resistance']:.2f}x" if sr['resistance'] else "🔴 Resistencia: -",
+        f"{support_txt}\n{resist_txt}",
         parse_mode='Markdown')
 
 @bot.message_handler(commands=['estadisticas'])
 async def cmd_estadisticas(message):
-    s = g_session
-    stats = get_quota_stats(200)
-    trend = quota_stats_text(stats)
-    perf = g_ml_engine.performance_stats()
-    gp_line = s.status_short()
-    # últimas fichas
-    fichas_recientes = s.fichas[-15:]
-    if fichas_recientes:
+    s              = g_session
+    stats          = get_quota_stats(200)
+    trend          = quota_stats_text(stats)
+    gp_line        = s.status_short()
+    fichas_rec     = s.fichas[-15:]
+    if fichas_rec:
         lineas = []
-        for f in fichas_recientes:
-            total = f['c1'] + f['c2'] + f['c3']
-            net = BASE_BET if f['result'] == 'win' else -total
-            res = "✅" if f['result'] == 'win' else "❌"
-            cols_txt = f"C1:${f['c1']:.2f}" + (f" C2:${f['c2']:.2f}" if f['c2']>0 else "") + (f" C3:${f['c3']:.2f}" if f['c3']>0 else "")
-            lineas.append(f"{res} #{f['n']} {f.get('ts','--:--')} | {cols_txt} | {'+$'+str(net) if net>=0 else '-$'+str(abs(net))}")
+        for f in fichas_rec:
+            total  = f['c1'] + f['c2'] + f['c3']
+            net    = BASE_BET if f['result'] == 'win' else -total
+            res    = "✅" if f['result'] == 'win' else "❌"
+            cols   = f"C1:${f['c1']:.2f}" + (f" C2:${f['c2']:.2f}" if f['c2'] > 0 else "") + (f" C3:${f['c3']:.2f}" if f['c3'] > 0 else "")
+            neto   = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
+            lineas.append(f"{res} #{f['n']} {f.get('ts','--:--')} | {cols} | {neto}")
         fichas_txt = "\n".join(lineas)
-        total_fichas = len(s.fichas)
-        wins_f = sum(1 for f in s.fichas if f['result'] == 'win')
-        resumen = f"Total fichas: `{total_fichas}` | ✅ `{wins_f}` | ❌ `{total_fichas-wins_f}`"
+        total_f    = len(s.fichas)
+        wins_f     = sum(1 for f in s.fichas if f['result'] == 'win')
+        resumen    = f"Total fichas: `{total_f}` | ✅ `{wins_f}` | ❌ `{total_f-wins_f}`"
     else:
         fichas_txt = "_Sin fichas registradas aún._"
-        resumen = "Total fichas: `0` | ✅ `0` | ❌ `0`"
-    ml_perf = ""
-    if perf['total'] > 0:
-        ml_perf = (f"━━━━━━━━━━━━━━━━━━━━━━━\n🤖 *Motor IA — Precisión*\n"
-                   f"📌 Señales: `{perf['total']}` | Precisión: `{perf['accuracy']}%` | Conf. prom.: `{perf['avg_conf']}%`\n")
-        if perf['high_conf_acc']:
-            ml_perf += f"💎 Alta confianza: `{perf['high_conf_acc']}%` en `{perf['high_total']}` señales\n"
+        resumen    = "Total fichas: `0` | ✅ `0` | ❌ `0`"
     await bot.reply_to(message,
         "📊 *ESTADÍSTICAS DEL BOT*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1196,28 +1567,34 @@ async def cmd_estadisticas(message):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"*Últimas fichas:*\n{fichas_txt}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{resumen}\n{ml_perf}\n{trend}",
+        f"{resumen}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trend}",
         parse_mode='Markdown')
+
+@bot.message_handler(commands=['tendencia'])
+async def cmd_tendencia(message):
+    stats = get_quota_stats(200)
+    await bot.reply_to(message, quota_stats_text(stats), parse_mode='Markdown')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 async def main_async():
-    logger.info("🤖 Iniciando CrashBot IA v4.0 — Estrategias Duales (Crash + Maestro)")
+    logger.info("🎭 Iniciando CrashBot Maestro Unificado + Filtro Moderado")
+    reset_daily_if_needed()
     await bot.set_my_commands([
-        types.BotCommand('start', '🚀 Iniciar / Ver tendencia'),
-        types.BotCommand('estadisticas', '📊 Estadísticas'),
-        types.BotCommand('ia', '🤖 Análisis IA (Bayes+Markov)'),
-        types.BotCommand('mercado', '📡 Estado del mercado'),
-        types.BotCommand('maestro', '🎭 Estrategia Maestro'),
+        types.BotCommand('start',        '🚀 Iniciar'),
+        types.BotCommand('señal',        '🎯 Última predicción Maestro'),
+        types.BotCommand('estadisticas', '📊 Estadísticas y fichas'),
+        types.BotCommand('tendencia',    '📈 Tendencia de cuotas'),
     ])
     asyncio.create_task(http_poller())
     asyncio.create_task(self_ping_loop())
-    logger.info("✅ Tareas de fondo iniciadas. Iniciando polling Telegram...")
+    logger.info("✅ Tareas iniciadas — polling Telegram...")
     await bot.infinity_polling(skip_pending=True)
 
 if __name__ == '__main__':
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
     asyncio.run(main_async())
