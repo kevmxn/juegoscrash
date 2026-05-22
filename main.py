@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class Config:
     """Configuración global del bot (modificable manualmente)."""
     BOT_TOKEN = "8620810853:AAHw-3JXcQt7Oz6Qcdv16Yt6JBG9m05UyYo"
-    CHANNEL_ID = -1003613599867      # Canal fijo
+    CHANNEL_ID = -1003613599867    # Canal fijo
 
     WS_URL = "wss://dga.pragmaticplaylive.net/ws"
     CASINO_ID = "ppcdk00000005349"
