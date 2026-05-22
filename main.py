@@ -1,414 +1,919 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════╗
+║   CRASH BOT — Sistema Moderado 2.00x            ║
+║   API HTTPS Polling en tiempo real              ║
+║   Stake Crash | Sesión Global | Render-Ready    ║
+╚══════════════════════════════════════════════════╝
 
-import requests
-import time
-import sqlite3
-import threading
+Diferencias vs Spaceman (main_spaceman.py):
+  - Fuente de datos: HTTP polling (no WebSocket)
+  - API: https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest
+  - Almacenamiento: en memoria (no SQLite — Render no tiene disco persistente)
+  - Flask HTTP: health-check en / y /ping para Render
+  - Todo async con aiohttp (sin requests bloqueantes)
+"""
+
 import asyncio
-import websockets
+import threading
 import json
-import os
-import random
 import logging
+import os
 import sys
-from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import time
+import random
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
+from flask import Flask
+import aiohttp
+from telebot.async_telebot import AsyncTeleBot
+from telebot import types
 
-# ============================================
-# CONFIGURACIÓN DE LOGGING PARA RENDER
-# ============================================
-# Configurar logging para que sea visible en la consola de Render
+# ─── LOGGING (stdout para Render) ─────────────────────────────────────────────
 logging.basicConfig(
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-API_CRASH = 'https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest'
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "TU_TOKEN_AQUI")
 
-# 30+ user‑agents rotativos
+# Endpoint HTTPS de Crash (Stake vía casino.org)
+API_CRASH  = "https://api-cs.casino.org/svc-evolution-game-events/api/stakecrash/latest"
+
+# Parámetros del bot
+WIN_TARGET = 2.00    # Objetivo de multiplicador
+MAX_MULTS  = 400     # Historial máximo en memoria
+TRIM_MULTS = 200     # Recorte cuando se supera MAX_MULTS
+MAX_COLS   = 3       # Columnas de gestión
+MAX_ATTS   = 2       # Intentos por columna
+CYCLE_SIZE = 10      # Señales exitosas por ciclo
+BASE_BET   = 0.10    # Apuesta base fija (USD)
+
+# Polling
+POLL_INTERVAL    = 3.0   # segundos entre requests (giro de Crash ~20-60 s)
+POLL_INTERVAL_OK = 3.0   # intervalo normal
+POLL_MAX_SLEEP   = 60.0  # backoff máximo
+POLL_BACKOFF_BASE= 2.0   # base del backoff exponencial
+
+# User-agents rotativos para evitar bloqueos
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Windows NT 10.0; rv:120.0) Gecko/20100101 Firefox/120.0',
-    'Mozilla/5.0 (Windows NT 10.0; rv:119.0) Gecko/20100101 Firefox/119.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (iPad; CPU OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36',
-    'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36',
-    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-    'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:115.0) Gecko/20100101 Firefox/115.0',
-    'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
+    '(KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 '
+    '(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36',
 ]
 
-DB_FILE = 'eventos.db'
-MAX_HISTORY = 600
+# ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
+g_mults:    list  = []      # {'id':..., 'value':..., 'ts':...}
+g_seen_ids: set   = set()   # IDs ya procesados (evita duplicados)
+g_positions: list = []      # Serie de posición acumulada (+1/-1)
+g_ema4:  list     = []
+g_ema8:  list     = []
+g_ema20: list     = []
 
-BASE_SLEEP = 1.0
-MAX_SLEEP = 60.0
+g_signal_state               = 'idle'   # 'idle' | 'evaluating' | 'so'
+g_signal_type: Optional[str] = None
+g_signal_strictness: int     = 0
+g_signal_trigger_mult: float = 0.0
 
-# ============================================
-# BASE DE DATOS
-# ============================================
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS eventos
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  api TEXT,
-                  event_id TEXT,
-                  maxMultiplier REAL,
-                  roundDuration REAL,
-                  startedAt TEXT,
-                  timestamp_recepcion TEXT)''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_api ON eventos (api)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON eventos (timestamp_recepcion)')
-    conn.commit()
-    conn.close()
-    logger.info("✅ Base de datos inicializada correctamente")
+g_all_chats: set                  = set()   # chats que enviaron /start
+g_trend_favorable: Optional[bool] = None
 
-init_db()
-
-def guardar_evento(api, event_id, maxMultiplier, roundDuration, startedAt):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    c.execute('''INSERT INTO eventos (api, event_id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion)
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (api, event_id, maxMultiplier, roundDuration, startedAt, timestamp))
-    conn.commit()
-    c.execute('''DELETE FROM eventos WHERE id IN (
-                    SELECT id FROM eventos WHERE api = ? ORDER BY timestamp_recepcion DESC LIMIT -1 OFFSET ?
-                )''', (api, MAX_HISTORY))
-    conn.commit()
-    conn.close()
-    return timestamp
-
-def obtener_ultimos_eventos(api, limite=MAX_HISTORY):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''SELECT api, event_id, maxMultiplier, roundDuration, startedAt, timestamp_recepcion
-                 FROM eventos WHERE api = ? ORDER BY timestamp_recepcion DESC LIMIT ?''', (api, limite))
-    filas = c.fetchall()
-    conn.close()
-    eventos = []
-    for fila in filas:
-        eventos.append({
-            'api': fila[0],
-            'event_id': fila[1],
-            'maxMultiplier': fila[2],
-            'roundDuration': fila[3],
-            'startedAt': fila[4],
-            'timestamp_recepcion': fila[5]
-        })
-    return eventos
-
-def obtener_estadisticas_giros():
-    """Obtiene estadísticas de los últimos giros para logging"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-
-    # Total de giros
-    c.execute("SELECT COUNT(*) FROM eventos WHERE api = 'crash'")
-    total_giros = c.fetchone()[0]
-
-    # Promedio de multiplicadores
-    c.execute("SELECT AVG(maxMultiplier) FROM eventos WHERE api = 'crash'")
-    avg_multiplier = c.fetchone()[0] or 0
-
-    # Último giro
-    c.execute("SELECT maxMultiplier, startedAt FROM eventos WHERE api = 'crash' ORDER BY timestamp_recepcion DESC LIMIT 1")
-    ultimo = c.fetchone()
-
-    # Giros en la última hora
-    c.execute("SELECT COUNT(*) FROM eventos WHERE api = 'crash' AND timestamp_recepcion > datetime('now', '-1 hour')")
-    giros_ultima_hora = c.fetchone()[0]
-
-    conn.close()
-
-    return {
-        'total_giros': total_giros,
-        'avg_multiplier': round(avg_multiplier, 2),
-        'ultimo_multiplicador': round(ultimo[0], 2) if ultimo else None,
-        'ultimo_startedAt': ultimo[1] if ultimo else None,
-        'giros_ultima_hora': giros_ultima_hora
-    }
-
-# ============================================
-# CONFIGURACIÓN DE SESIÓN HTTP
-# ============================================
-def crear_sesion():
-    sesion = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=0.1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=['GET']
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    sesion.mount('http://', adapter)
-    sesion.mount('https://', adapter)
-    return sesion
-
-sesion_global = crear_sesion()
-
-# ============================================
-# FUNCIÓN DE CONSULTA CON BACKOFF
-# ============================================
-api_status = {
+# Estado del poller (para /stats)
+g_poller_status = {
+    'total_requests':  0,
+    'total_new_rounds': 0,
     'consecutive_errors': 0,
-    'next_allowed_time': 0,
-    'total_requests': 0,
-    'total_giros_detectados': 0
+    'last_poll_ts':    0.0,
+    'last_round_ts':   0.0,
 }
 
-def get_random_user_agent():
-    return random.choice(USER_AGENTS)
+bot = AsyncTeleBot(BOT_TOKEN)
 
-def consultar_con_backoff(url):
-    now = time.time()
-    api_status['total_requests'] += 1
 
-    if now < api_status['next_allowed_time']:
-        wait = api_status['next_allowed_time'] - now
-        logger.info(f"⏳ API en espera por {wait:.1f}s (backoff)")
-        time.sleep(wait)
+# ─── HORA ARGENTINA ───────────────────────────────────────────────────────────
+def argentina_time() -> str:
+    now_arg = datetime.utcnow() - timedelta(hours=3)
+    return now_arg.strftime("%H:%M")
+
+
+# ─── BROADCAST ────────────────────────────────────────────────────────────────
+async def broadcast(msg: str, parse_mode: str = None):
+    dead = set()
+    for chat_id in list(g_all_chats):
+        try:
+            await bot.send_message(chat_id, msg, parse_mode=parse_mode)
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ('blocked', 'not found', 'deactivated', 'kicked')):
+                dead.add(chat_id)
+                logger.warning(f"Chat {chat_id} inactivo → removido")
+            else:
+                logger.warning(f"Broadcast error → {chat_id}: {e}")
+    g_all_chats.difference_update(dead)
+
+
+async def broadcast_trend_change(favorable: bool):
+    hora = argentina_time()
+    msg  = f"🟢 TENDENCIA FAVORABLE  {hora}" if favorable else f"🔴 TENDENCIA DESFAVORABLE  {hora}"
+    logger.info(f"📢 Broadcast tendencia: {msg} → {len(g_all_chats)} chats")
+    await broadcast(msg)
+
+
+# ─── MOTOR DE EMAs ────────────────────────────────────────────────────────────
+def calc_ema(data: list, period: int) -> list:
+    if not data:
+        return []
+    k = 2 / (period + 1)
+    ema = [data[0]]
+    for i in range(1, len(data)):
+        ema.append((data[i] - ema[i - 1]) * k + ema[i - 1])
+    return ema
+
+
+# ─── ESTADÍSTICAS DE CUOTAS ───────────────────────────────────────────────────
+def get_quota_stats(n: int = 200) -> dict:
+    """
+    Calcula estadísticas de cuotas para los últimos n multiplicadores.
+    Desfavorable: 1.00-1.99x > 52% O 2.00-4.99x < 29%.
+    """
+    data  = g_mults[-n:] if len(g_mults) >= n else g_mults[:]
+    total = len(data)
+    if total == 0:
+        return {
+            'total': 0, 'has_enough': False, 'favorable': None,
+            'count_100_199': 0, 'count_200_499': 0,
+            'count_500_999': 0, 'count_1000_plus': 0,
+            'pct_100_199': 0.0, 'pct_200_499': 0.0,
+            'pct_500_999': 0.0, 'pct_1000_plus': 0.0,
+        }
+
+    r1 = sum(1 for m in data if 1.00 <= m['value'] <  2.00)
+    r2 = sum(1 for m in data if 2.00 <= m['value'] <  5.00)
+    r3 = sum(1 for m in data if 5.00 <= m['value'] < 10.00)
+    r4 = sum(1 for m in data if m['value'] >= 10.00)
+
+    pct1 = r1 / total * 100
+    pct2 = r2 / total * 100
+    pct3 = r3 / total * 100
+    pct4 = r4 / total * 100
+
+    unfavorable = pct1 > 52.0 or pct2 < 29.0
+
+    return {
+        'total':           total,
+        'has_enough':      total >= 200,
+        'favorable':       not unfavorable,
+        'count_100_199':   r1,
+        'count_200_499':   r2,
+        'count_500_999':   r3,
+        'count_1000_plus': r4,
+        'pct_100_199':     pct1,
+        'pct_200_499':     pct2,
+        'pct_500_999':     pct3,
+        'pct_1000_plus':   pct4,
+    }
+
+
+def quota_stats_text(stats: dict) -> str:
+    if stats['total'] == 0:
+        return "📡 _Sin datos suficientes para analizar cuotas._\n"
+
+    n_label = "200" if stats['has_enough'] else str(stats['total']) + " (acumulando...)"
+    r1_flag = " ✅" if stats['pct_100_199'] <= 52.0 else " ❌"
+    r2_flag = " ✅" if stats['pct_200_499'] >= 29.0 else " ❌"
+    fav_line = (
+        "✅ *¡TENDENCIA FAVORABLE!*\n      _Se recomienda operar_"
+        if stats['favorable'] else
+        "⚠️ *TENDENCIA DESFAVORABLE*\n      _Se recomienda esperar_"
+    )
+
+    return (
+        f"📈 *Análisis de la Tendencia últimos*\n"
+        f"      *{n_label} multiplicadores*\n"
+        f"🔵 Cuotas (1.00-1.99x): `{stats['count_100_199']}` — {stats['pct_100_199']:.2f}%{r1_flag}\n"
+        f"🟣 Cuotas (2.00-4.99x): `{stats['count_200_499']}` — {stats['pct_200_499']:.2f}%{r2_flag}\n"
+        f"🟡 Cuotas (5.00-9.99x): `{stats['count_500_999']}` — {stats['pct_500_999']:.2f}%\n"
+        f"🔴 Cuotas (+10.00x):    `{stats['count_1000_plus']}` — {stats['pct_1000_plus']:.2f}%\n"
+        " \n"
+        f"{fav_line}\n"
+    )
+
+
+# ─── DETECCIÓN DE SEÑAL ───────────────────────────────────────────────────────
+def check_moderate_signal() -> Optional[Tuple[str, int]]:
+    """
+    Retorna ('alert200', strictness) o None.
+      S1 → EMA8 cruza por encima de EMA20
+      S2 → patrón V + precio sobre las 3 EMAs
+      S3 → 2 consecutivos ≥2.00 + EMAs alineadas (4>8>20)
+    """
+    pos  = g_positions
+    e4   = g_ema4
+    e8   = g_ema8
+    e20  = g_ema20
+    data = g_mults
+
+    if len(data) < 4 or len(pos) < 4:
         return None
 
-    headers = {'User-Agent': get_random_user_agent()}
-    try:
-        resp = sesion_global.get(url, headers=headers, timeout=5)
+    cur_pos = pos[-1]
+    cur_e4  = e4[-1]  if e4           else cur_pos
+    cur_e8  = e8[-1]  if e8           else cur_pos
+    cur_e20 = e20[-1] if e20          else cur_pos
+    prv_e8  = e8[-2]  if len(e8)  > 1 else cur_e8
+    prv_e20 = e20[-2] if len(e20) > 1 else cur_e20
 
-        if 'Retry-After' in resp.headers:
-            retry_after = int(resp.headers['Retry-After'])
-            api_status['next_allowed_time'] = time.time() + retry_after
-            api_status['consecutive_errors'] += 1
-            logger.warning(f"⚠️ API pide esperar {retry_after}s (Retry-After header)")
-            return None
+    # S1: EMA8 cruza por encima de EMA20
+    if len(e8) >= 2 and prv_e8 <= prv_e20 and cur_e8 > cur_e20:
+        return ('alert200', 1)
 
-        if resp.status_code == 200:
-            api_status['consecutive_errors'] = 0
-            return resp.json()
-        elif resp.status_code == 429:
-            retry_after = int(resp.headers.get('Retry-After', 2 ** api_status['consecutive_errors']))
-            api_status['next_allowed_time'] = time.time() + retry_after
-            api_status['consecutive_errors'] += 1
-            logger.warning(f"⚠️ Rate limited (429). Esperando {retry_after}s")
-            return None
-        elif 500 <= resp.status_code < 600:
-            api_status['consecutive_errors'] += 1
-            backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
-            api_status['next_allowed_time'] = time.time() + backoff
-            logger.error(f"❌ Error servidor {resp.status_code}. Backoff {backoff:.1f}s")
-            return None
+    # S2: patrón V + precio sobre las 3 EMAs
+    if len(pos) >= 3:
+        a, b, c = pos[-3], pos[-2], pos[-1]
+        if (abs(a - c) <= 1 and b > a
+                and cur_pos > cur_e4
+                and cur_pos > cur_e8
+                and cur_pos > cur_e20):
+            return ('alert200', 2)
+
+    # S3: 2 consecutivos ≥2.00 + EMAs alineadas + anterior <2.00
+    if (len(data) >= 2
+            and data[-1]['value'] >= WIN_TARGET
+            and data[-2]['value'] >= WIN_TARGET
+            and cur_e4 > cur_e8 > cur_e20):
+        before = data[-3] if len(data) >= 3 else None
+        if before is None or before['value'] < WIN_TARGET:
+            return ('alert200', 3)
+
+    return None
+
+
+# ─── SESIÓN GLOBAL ────────────────────────────────────────────────────────────
+class GlobalSession:
+    """
+    Sesión única compartida por todos los usuarios.
+    Apuesta base fija: BASE_BET ($0.10).
+    Rastrea fichas (C1+C2+C3) para estadísticas reales.
+    """
+    IDLE       = 'idle'
+    EVALUATING = 'evaluating'
+    WAITING_SO = 'waiting_so'
+    DONE       = 'done'
+
+    def __init__(self, carry_fichas: list = None):
+        self.base_bet = BASE_BET
+        self.state    = self.IDLE
+
+        self.scale   = 1
+        self.col     = 1
+        self.attempt = 1
+        self.lost    = 0.0
+        self.cur_bet = BASE_BET
+
+        self.entries = 0
+        self.wins    = 0
+        self.losses  = 0
+        self.created = datetime.now()
+
+        self.signal_trigger_mult:   float = 0.0
+        self.attempt1_result_value: float = 0.0
+
+        self.fichas: list  = carry_fichas if carry_fichas is not None else []
+        self._cur_ficha: dict = None
+
+    def start_ficha(self):
+        self._cur_ficha = {
+            'n':      len(self.fichas) + 1,
+            'c1':     0.0,
+            'c2':     0.0,
+            'c3':     0.0,
+            'result': None,
+            'ts':     argentina_time(),
+        }
+
+    def on_result(self, win: bool) -> tuple:
+        """
+        Retorna (tipo, bet_amount).
+        Tipos: 'win' | 'cycle_win' | 'so' | 'new_col' | 'cycle_loss'
+        """
+        self.entries += 1
+        prev_bet = self.cur_bet
+        prev_col = self.col
+
+        if self._cur_ficha is not None:
+            col_key = f'c{prev_col}'
+            self._cur_ficha[col_key] = self._cur_ficha.get(col_key, 0.0) + prev_bet
+
+        if win:
+            self.wins   += 1
+            self.lost    = 0.0
+            self.cur_bet = self.base_bet
+            self.col     = 1
+            self.attempt = 1
+            self.scale  += 1
+
+            if self._cur_ficha is not None:
+                self._cur_ficha['result'] = 'win'
+                self.fichas.append(self._cur_ficha)
+                self._cur_ficha = None
+            if len(self.fichas) > 100:
+                self.fichas = self.fichas[-100:]
+
+            if self.scale > CYCLE_SIZE:
+                self.state = self.DONE
+                return ('cycle_win', prev_bet)
+            self.state = self.IDLE
+            return ('win', prev_bet)
+
         else:
-            logger.warning(f"⚠️ Código no esperado: {resp.status_code}")
-            return None
+            self.losses  += 1
+            self.lost    += prev_bet
+            self.cur_bet  = self.lost + self.base_bet
+            self.attempt += 1
 
-    except requests.exceptions.Timeout:
-        api_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
-        api_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"⏰ Timeout. Backoff {backoff:.1f}s")
-        return None
-    except Exception as e:
-        api_status['consecutive_errors'] += 1
-        backoff = min(MAX_SLEEP, BASE_SLEEP * (2 ** api_status['consecutive_errors']))
-        api_status['next_allowed_time'] = time.time() + backoff
-        logger.error(f"💥 Error: {e}. Backoff {backoff:.1f}s")
-        return None
+            if self.attempt > MAX_ATTS:
+                self.attempt = 1
+                self.col    += 1
+                if self.col > MAX_COLS:
+                    if self._cur_ficha is not None:
+                        self._cur_ficha['result'] = 'loss'
+                        self.fichas.append(self._cur_ficha)
+                        self._cur_ficha = None
+                    if len(self.fichas) > 100:
+                        self.fichas = self.fichas[-100:]
+                    self.state = self.DONE
+                    return ('cycle_loss', prev_bet)
+                self.state = self.IDLE
+                return ('new_col', prev_bet)
+            else:
+                self.state = self.WAITING_SO
+                return ('so', prev_bet)
 
-# ============================================
-# SERVIDOR WEBSOCKET
-# ============================================
-connected_clients = set()
-websocket_loop = None
-stop_websocket = threading.Event()
+    def status_short(self) -> str:
+        estado_txt = {
+            self.IDLE:       "⏳ Esperando señal",
+            self.EVALUATING: "⚡ Evaluando resultado",
+            self.WAITING_SO: "🔄 Esperando 2ª Oportunidad",
+            self.DONE:       "✅ Ciclo finalizado",
+        }.get(self.state, "—")
 
-async def websocket_handler(websocket):
-    client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
-    connected_clients.add(websocket)
-    logger.info(f"🔌 Cliente WebSocket conectado: {client_info} (Total: {len(connected_clients)})")
-
-    try:
-        eventos = obtener_ultimos_eventos('crash', MAX_HISTORY)
-        if eventos:
-            await websocket.send(json.dumps({
-                'tipo': 'historial',
-                'api': 'crash',
-                'eventos': eventos
-            }, default=str))
-            logger.info(f"📤 Historial enviado a {client_info} ({len(eventos)} eventos)")
-        await websocket.wait_closed()
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"🔌 Cliente desconectado: {client_info}")
-    except Exception as e:
-        logger.error(f"❌ Error en WebSocket handler: {e}")
-    finally:
-        connected_clients.remove(websocket)
-        logger.info(f"🔌 Cliente eliminado. Total conectados: {len(connected_clients)}")
-
-async def websocket_server():
-    global websocket_loop
-    port = int(os.environ.get('PORT', 8080))
-    async with websockets.serve(websocket_handler, "0.0.0.0", port):
-        logger.info(f"✅ Servidor WebSocket iniciado en puerto {port}")
-        websocket_loop = asyncio.get_running_loop()
-        while not stop_websocket.is_set():
-            await asyncio.sleep(1)
-
-def start_websocket_server():
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(websocket_server())
-    except Exception as e:
-        logger.error(f"Error fatal en WebSocket server: {e}")
-
-threading.Thread(target=start_websocket_server, daemon=True).start()
-
-async def _async_broadcast(message):
-    if connected_clients:
-        await asyncio.gather(
-            *[client.send(message) for client in connected_clients],
-            return_exceptions=True
+        return (
+            f"📡 Estado: {estado_txt}\n"
+            f"🎯 Señal: `{min(self.scale, CYCLE_SIZE)}/{CYCLE_SIZE}`\n"
+            f"📍 Col: `{self.col}/{MAX_COLS}` | Intento: `{self.attempt}/{MAX_ATTS}`\n"
+            f"💵 Próxima apuesta: `${self.cur_bet:.2f}`\n"
+            f"📈 G/P: `{self.wins}/{self.losses}`"
         )
 
-def broadcast(event_data):
-    if websocket_loop is None or not connected_clients:
-        return
-    message = json.dumps(event_data, default=str)
-    asyncio.run_coroutine_threadsafe(_async_broadcast(message), websocket_loop)
 
-# ============================================
-# FUNCIÓN PARA LOGGEAR ESTADO DE GIROS
-# ============================================
-last_log_time = 0
-LOG_INTERVAL = 30  # Loggear estadísticas cada 30 segundos
+# ─── INSTANCIA GLOBAL ─────────────────────────────────────────────────────────
+g_session: GlobalSession = GlobalSession()
 
-def log_estado_giros(forzar=False):
-    """Loggea el estado actual de los giros"""
-    global last_log_time
 
-    now = time.time()
-    if not forzar and now - last_log_time < LOG_INTERVAL:
-        return
+def reset_global_session():
+    global g_session
+    old_fichas = list(g_session.fichas)
+    g_session  = GlobalSession(carry_fichas=old_fichas)
+    logger.info("🔄 Sesión global reiniciada — fichas preservadas")
 
-    last_log_time = now
-    stats = obtener_estadisticas_giros()
 
-    logger.info("=" * 60)
-    logger.info("🎰 ESTADÍSTICAS DE GIROS CRASH")
-    logger.info("=" * 60)
-    logger.info(f"📊 Total de giros registrados: {stats['total_giros']}")
-    logger.info(f"🎯 Promedio de multiplicadores: {stats['avg_multiplier']}x")
-    logger.info(f"⚡ Giros en última hora: {stats['giros_ultima_hora']}")
-    logger.info(f"🔢 Requests totales a API: {api_status['total_requests']}")
-    logger.info(f"🆕 Giros nuevos detectados: {api_status['total_giros_detectados']}")
-    logger.info(f"👥 Clientes WebSocket conectados: {len(connected_clients)}")
+# ─── PROCESADOR DE MULTIPLICADORES ───────────────────────────────────────────
+async def process_multiplier(value: float, round_id: str):
+    global g_signal_state, g_signal_type, g_signal_strictness, g_signal_trigger_mult
+    global g_positions, g_ema4, g_ema8, g_ema20, g_mults, g_seen_ids
+    global g_trend_favorable, g_session
 
-    if stats['ultimo_multiplicador']:
-        logger.info(f"🎲 Último giro: {stats['ultimo_multiplicador']}x @ {stats['ultimo_startedAt']}")
+    logger.info(
+        f"🎲 {value:.2f}x | ID: {round_id} | "
+        f"Señal: {g_signal_state}/{g_signal_type} (S{g_signal_strictness})"
+    )
 
-    logger.info("=" * 60)
-
-# ============================================
-# BUCLE PRINCIPAL (Crash únicamente)
-# ============================================
-logger.info("🚀 Iniciando monitoreo de Crash...")
-logger.info("📡 Conectando a API: " + API_CRASH)
-
-crash_ids = set()
-giro_counter = 0
-
-# Loggear estado inicial
-log_estado_giros(forzar=True)
-
-try:
-    while True:
-        now = time.time()
-
-        # Loggear estado periódicamente
-        log_estado_giros()
-
-        if now >= api_status['next_allowed_time']:
-            crash_data = consultar_con_backoff(API_CRASH)
-            if crash_data:
-                api_id = crash_data.get('id')
-                if api_id and api_id not in crash_ids:
-                    crash_ids.add(api_id)
-                    api_status['total_giros_detectados'] += 1
-                    giro_counter += 1
-
-                    data_inner = crash_data.get('data', {})
-                    result = data_inner.get('result', {})
-                    max_mult = result.get('maxMultiplier')
-                    round_dur = result.get('roundDuration')
-                    started_at = data_inner.get('startedAt')
-
-                    if max_mult is not None and max_mult > 0:
-                        timestamp = guardar_evento('crash', api_id, max_mult, round_dur, started_at)
-
-                        # Log detallado del giro
-                        logger.info("-" * 50)
-                        logger.info(f"🎰 NUEVO GIRO DETECTADO (#{giro_counter})")
-                        logger.info(f"   📋 ID: {api_id}")
-                        logger.info(f"   💥 Multiplicador: {max_mult}x")
-                        logger.info(f"   ⏱️ Duración: {round_dur}s")
-                        logger.info(f"   🕐 Iniciado: {started_at}")
-                        logger.info(f"   💾 Guardado en DB: {timestamp}")
-                        logger.info("-" * 50)
-
-                        broadcast({
-                            'tipo': 'crash',
-                            'id': api_id,
-                            'maxMultiplier': max_mult,
-                            'roundDuration': round_dur,
-                            'startedAt': started_at,
-                            'timestamp_recepcion': timestamp,
-                            'giro_numero': giro_counter
-                        })
-                    else:
-                        logger.warning(f"⚠️ Giro ID {api_id} con multiplicador inválido: {max_mult}")
-
-        wait = max(0, api_status['next_allowed_time'] - time.time())
-        if wait > 0:
-            jitter = random.uniform(0.9, 1.1)
-            sleep_time = wait * jitter
-            logger.debug(f"⏱️  Esperando {sleep_time:.2f}s (con jitter)")
-            time.sleep(sleep_time)
+    # ── FASE 1: Procesar resultado principal ─────────────────────────────────
+    if g_signal_state == 'evaluating':
+        win = value >= WIN_TARGET
+        if g_session.state == GlobalSession.EVALUATING:
+            tipo, bet = g_session.on_result(win)
+            await _dispatch_result(value, tipo, bet, is_so=False)
+            g_signal_state = 'so' if g_session.state == GlobalSession.WAITING_SO else 'idle'
+            if g_signal_state != 'so':
+                g_signal_type       = None
+                g_signal_strictness = 0
         else:
-            time.sleep(0.5)
+            g_signal_state      = 'idle'
+            g_signal_type       = None
+            g_signal_strictness = 0
 
-except KeyboardInterrupt:
-    logger.info("
-⏹ Monitoreo detenido por el usuario.")
-    log_estado_giros(forzar=True)
-    stop_websocket.set()
-    time.sleep(1)
-except Exception as e:
-    logger.exception(f"❌ Error fatal en bucle principal: {e}")
-    log_estado_giros(forzar=True)
-    stop_websocket.set()
-    raise
+    # ── FASE 2: Procesar resultado SO ────────────────────────────────────────
+    elif g_signal_state == 'so':
+        win = value >= WIN_TARGET
+        g_signal_state      = 'idle'
+        g_signal_type       = None
+        g_signal_strictness = 0
+        if g_session.state == GlobalSession.WAITING_SO:
+            tipo, bet = g_session.on_result(win)
+            await _dispatch_result(value, tipo, bet, is_so=True)
+
+    # ── FASE 3: Actualizar datos y EMAs ─────────────────────────────────────
+    increment = 1 if value >= WIN_TARGET else -1
+    prev = g_positions[-1] if g_positions else 0
+    g_positions.append(prev + increment)
+    g_mults.append({'id': round_id, 'value': value, 'ts': time.time()})
+
+    if len(g_mults) >= MAX_MULTS:
+        g_mults[:]     = g_mults[-TRIM_MULTS:]
+        g_positions[:] = g_positions[-TRIM_MULTS:]
+        logger.info(f"✂️ Datos recortados a {TRIM_MULTS} registros")
+
+    g_ema4  = calc_ema(g_positions, 4)
+    g_ema8  = calc_ema(g_positions, 8)
+    g_ema20 = calc_ema(g_positions, 20)
+
+    if len(g_seen_ids) > 2000:
+        g_seen_ids.clear()   # reset simple — los IDs ya están en g_mults
+
+    # ── FASE 4: Detectar cambio de tendencia ────────────────────────────────
+    if g_all_chats:
+        stats_trend = get_quota_stats(200)
+        if stats_trend['total'] >= 10:
+            new_fav = stats_trend['favorable']
+            if new_fav != g_trend_favorable:
+                g_trend_favorable = new_fav
+                asyncio.create_task(broadcast_trend_change(new_fav))
+
+    # ── FASE 5: Detectar nueva señal ────────────────────────────────────────
+    if g_signal_state == 'idle' and g_session.state == GlobalSession.IDLE:
+        sig_result = check_moderate_signal()
+        if sig_result:
+            sig_type, strictness = sig_result
+            if strictness >= g_session.col:
+                if g_session.col > 1:
+                    proceed = True
+                else:
+                    stats_now = get_quota_stats(200)
+                    proceed   = (stats_now['total'] == 0) or (stats_now['favorable'] is not False)
+
+                if proceed:
+                    g_signal_state        = 'evaluating'
+                    g_signal_type         = sig_type
+                    g_signal_strictness   = strictness
+                    g_signal_trigger_mult = value
+                    g_session.signal_trigger_mult = value
+                    g_session.state = GlobalSession.EVALUATING
+
+                    if g_session.col == 1:
+                        g_session.start_ficha()
+
+                    logger.info(f"🚀 SEÑAL S{strictness} Col{g_session.col} | Trigger: {value:.2f}x")
+                    await _send_signal(value, strictness)
+
+
+# ─── MENSAJERÍA ───────────────────────────────────────────────────────────────
+async def _send_signal(trigger: float, strictness: int):
+    nivel = {
+        1: "S1 — EMA Cruce",
+        2: "S2 — Patrón V",
+        3: "S3 — Doble ≥2.00",
+    }.get(strictness, "💎 2.00x")
+
+    txt = (
+        f"🚨 *¡SEÑAL DETECTADA! 💎 2.00x*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Último Multiplicador — `{trigger:.2f}x`\n"
+        f"💵 *Apostar Ahora: `${g_session.cur_bet:.2f}`*\n"
+        f"🕹️ Señal `{g_session.scale}/{CYCLE_SIZE}` | "
+        f"Col `{g_session.col}/{MAX_COLS}` | "
+        f"Intento `{g_session.attempt}/{MAX_ATTS}`\n"
+        f"📊 Nivel: _{nivel}_"
+    )
+    await broadcast(txt, parse_mode='Markdown')
+
+
+async def _check_trend_after_cycle():
+    stats = get_quota_stats(200)
+    if stats['total'] > 0 and not stats['favorable']:
+        hora  = argentina_time()
+        r1_flag = "✅" if stats['pct_100_199'] <= 52.0 else "❌"
+        r2_flag = "✅" if stats['pct_200_499'] >= 29.0 else "❌"
+        await broadcast(
+            f"🔴 *TENDENCIA DESFAVORABLE — {hora}*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔵 1.00-1.99x: `{stats['pct_100_199']:.1f}%` (límite ≤52%) {r1_flag}\n"
+            f"🟣 2.00-4.99x: `{stats['pct_200_499']:.1f}%` (mínimo ≥29%) {r2_flag}\n"
+            f"📊 Basado en los últimos `{stats['total']}` multiplicadores\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⏳ _El bot esperará hasta que la tendencia mejore._\n"
+            "_Se notificará automáticamente cuando sea favorable._",
+            parse_mode='Markdown'
+        )
+    else:
+        logger.info("✅ Post-ciclo: tendencia favorable — bot continúa analizando")
+
+
+async def _dispatch_result(value: float, tipo: str, bet: float, is_so: bool):
+    global g_session
+
+    emoji_val = "🟢" if value >= WIN_TARGET else "🔴"
+    so_prefix = "🔄 2ª Oportunidad — " if is_so else ""
+
+    # ── GANADA ───────────────────────────────────────────────────────────────
+    if tipo in ('win', 'cycle_win'):
+        if tipo == 'cycle_win':
+            txt = (
+                f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{so_prefix}💵 Próxima Apuesta: `${BASE_BET:.2f}`\n"
+                "\n"
+                "🏆 *¡CICLO COMPLETO — 10 señales exitosas!*\n"
+                f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
+                "🔄 _Sesión reiniciada automáticamente_"
+            )
+            await broadcast(txt, parse_mode='Markdown')
+            reset_global_session()
+            await _check_trend_after_cycle()
+            return
+
+        txt = (
+            f"✅ *GANADA* — {emoji_val} Resultado: `{value:.2f}x`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{so_prefix}💵 Próxima Apuesta: `${BASE_BET:.2f}`\n"
+            f"⏳ _Esperando próxima señal... ({g_session.scale}/{CYCLE_SIZE})_"
+        )
+
+    # ── PERDIDA → Segunda Oportunidad ────────────────────────────────────────
+    elif tipo == 'so':
+        g_session.attempt1_result_value = value
+        txt = (
+            f"❌ *Perdida* — {emoji_val} Resultado: `{value:.2f}x`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔄 *¡SEGUNDA OPORTUNIDAD!*\n"
+            f"💵 Apuesta: `${g_session.cur_bet:.2f}`\n"
+            f"🕹️ Col `{g_session.col}/{MAX_COLS}` | Intento `2/{MAX_ATTS}`"
+        )
+        await broadcast(txt, parse_mode='Markdown')
+        return
+
+    # ── SO FALLIDA → Avanzar columna ─────────────────────────────────────────
+    elif tipo == 'new_col':
+        r1 = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
+        txt = (
+            f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Avanzando a Columna `{g_session.col}/{MAX_COLS}`\n"
+            f"💵 Nueva apuesta: `${g_session.cur_bet:.2f}`\n"
+            "⏳ _Esperando próxima señal..._"
+        )
+
+    # ── CICLO PERDIDO ─────────────────────────────────────────────────────────
+    elif tipo == 'cycle_loss':
+        r1 = f"{g_session.attempt1_result_value:.2f}x" if g_session.attempt1_result_value else "—"
+        txt = (
+            f"🔴 *Resultados: `{r1}` — `{value:.2f}x`*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ *CICLO TERMINADO — 3 Columnas Fallidas*\n"
+            f"📊 G/P: `{g_session.wins}/{g_session.losses}`\n"
+            "🔄 _Sesión reiniciada automáticamente_"
+        )
+        await broadcast(txt, parse_mode='Markdown')
+        reset_global_session()
+        await _check_trend_after_cycle()
+        return
+
+    else:
+        txt = f"Resultado inesperado: {tipo}"
+
+    await broadcast(txt, parse_mode='Markdown')
+
+
+# ─── POLLER HTTPS (reemplaza al WebSocket de Spaceman) ───────────────────────
+async def http_poller():
+    """
+    Consulta la API HTTPS de Crash en Stake de forma asíncrona.
+    Usa backoff exponencial en errores y jitter para evitar bloqueos.
+    NO usa SQLite — todo en memoria (correcto para Render free tier).
+    """
+    consecutive_errors = 0
+    sleep_next = POLL_INTERVAL_OK
+
+    logger.info(f"📡 Iniciando poller HTTP → {API_CRASH}")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(sleep_next)
+
+            try:
+                ua = random.choice(USER_AGENTS)
+                headers = {
+                    'User-Agent': ua,
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Cache-Control': 'no-cache',
+                }
+
+                g_poller_status['total_requests'] += 1
+                g_poller_status['last_poll_ts']    = time.time()
+
+                async with session.get(
+                    API_CRASH,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    ssl=True,
+                ) as resp:
+
+                    # ── Rate limit ───────────────────────────────────────────
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get('Retry-After', 30))
+                        logger.warning(f"⚠️ Rate limited (429) → esperando {retry_after}s")
+                        consecutive_errors += 1
+                        sleep_next = min(POLL_MAX_SLEEP, retry_after + random.uniform(1, 5))
+                        continue
+
+                    # ── Error de servidor ────────────────────────────────────
+                    if resp.status >= 500:
+                        consecutive_errors += 1
+                        backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
+                        logger.error(f"❌ Error servidor {resp.status} → backoff {backoff:.1f}s")
+                        sleep_next = backoff
+                        continue
+
+                    # ── Otro código no OK ────────────────────────────────────
+                    if resp.status != 200:
+                        logger.warning(f"⚠️ Código inesperado: {resp.status}")
+                        consecutive_errors += 1
+                        sleep_next = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
+                        continue
+
+                    # ── Respuesta OK ─────────────────────────────────────────
+                    try:
+                        data = await resp.json(content_type=None)
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError) as e:
+                        logger.warning(f"⚠️ JSON inválido: {e}")
+                        consecutive_errors += 1
+                        sleep_next = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
+                        continue
+
+                    # ── Parsear respuesta ─────────────────────────────────────
+                    # Formato esperado:
+                    # { "id": "...", "data": { "result": { "maxMultiplier": 2.5, ... }, "startedAt": "..." } }
+                    api_id    = data.get('id')
+                    data_inner = data.get('data', {})
+                    result    = data_inner.get('result', {})
+                    max_mult  = result.get('maxMultiplier')
+
+                    if not api_id or max_mult is None or max_mult <= 0:
+                        # Puede estar en medio de un giro activo — es normal
+                        logger.debug(f"⏳ Giro en curso o sin resultado: {data}")
+                        consecutive_errors = 0
+                        sleep_next = POLL_INTERVAL_OK + random.uniform(0.5, 1.5)
+                        continue
+
+                    round_id = str(api_id)
+
+                    if round_id in g_seen_ids:
+                        # Mismo giro ya procesado — esperar el siguiente
+                        consecutive_errors = 0
+                        sleep_next = POLL_INTERVAL_OK + random.uniform(0.5, 1.5)
+                        continue
+
+                    # ── NUEVO GIRO ────────────────────────────────────────────
+                    g_seen_ids.add(round_id)
+                    g_poller_status['total_new_rounds'] += 1
+                    g_poller_status['last_round_ts']     = time.time()
+                    consecutive_errors = 0
+                    sleep_next = POLL_INTERVAL_OK + random.uniform(0.3, 1.0)
+
+                    logger.info(
+                        f"🎰 NUEVO GIRO #{g_poller_status['total_new_rounds']} | "
+                        f"ID: {round_id} | Multiplicador: {max_mult:.2f}x"
+                    )
+
+                    await process_multiplier(float(max_mult), round_id)
+
+            except aiohttp.ClientConnectorError as e:
+                consecutive_errors += 1
+                backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
+                logger.error(f"🔌 Sin conexión: {e} → backoff {backoff:.1f}s")
+                sleep_next = backoff
+
+            except asyncio.TimeoutError:
+                consecutive_errors += 1
+                backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
+                logger.error(f"⏰ Timeout → backoff {backoff:.1f}s")
+                sleep_next = backoff
+
+            except Exception as e:
+                consecutive_errors += 1
+                backoff = min(POLL_MAX_SLEEP, POLL_BACKOFF_BASE ** consecutive_errors)
+                logger.exception(f"💥 Error inesperado: {e} → backoff {backoff:.1f}s")
+                sleep_next = backoff
+
+            finally:
+                g_poller_status['consecutive_errors'] = consecutive_errors
+
+
+# ─── KEEP-ALIVE FLASK ─────────────────────────────────────────────────────────
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    last_round_ago = (
+        f"{int(time.time() - g_poller_status['last_round_ts'])}s atrás"
+        if g_poller_status['last_round_ts'] else "sin datos aún"
+    )
+    return (
+        f"🤖 CrashBot ACTIVO | "
+        f"Datos: {len(g_mults)}/400 | "
+        f"Sesión: {g_session.state} | "
+        f"Señal: {g_signal_state} | "
+        f"Giros: {g_poller_status['total_new_rounds']} | "
+        f"Último: {last_round_ago} | "
+        f"Chats: {len(g_all_chats)}"
+    ), 200
+
+@flask_app.route('/ping')
+def ping():
+    return "pong", 200
+
+@flask_app.route('/stats')
+def stats_route():
+    last5 = [f"{m['value']:.2f}x" for m in g_mults[-5:]] if g_mults else []
+    return {
+        "status":              "ok",
+        "mults_collected":     len(g_mults),
+        "signal_state":        g_signal_state,
+        "signal_type":         g_signal_type,
+        "trigger_mult":        g_signal_trigger_mult,
+        "session_state":       g_session.state,
+        "session_col":         g_session.col,
+        "wins":                g_session.wins,
+        "losses":              g_session.losses,
+        "fichas_total":        len(g_session.fichas),
+        "registered_chats":    len(g_all_chats),
+        "trend_favorable":     g_trend_favorable,
+        "last_5":              last5,
+        "poller_requests":     g_poller_status['total_requests'],
+        "poller_new_rounds":   g_poller_status['total_new_rounds'],
+        "poller_errors":       g_poller_status['consecutive_errors'],
+    }
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+
+# ─── SELF-PING (mantiene Render despierto) ────────────────────────────────────
+async def self_ping_loop():
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not render_url:
+        logger.info("RENDER_EXTERNAL_URL no configurada — self-ping desactivado")
+        return
+
+    url = f"{render_url.rstrip('/')}/ping"
+    logger.info(f"Self-ping cada 14 min → {url}")
+
+    while True:
+        await asyncio.sleep(14 * 60)
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    logger.info(f"Self-ping OK: {r.status}")
+        except Exception as e:
+            logger.warning(f"Self-ping falló: {e}")
+
+
+# ─── HANDLERS DE TELEGRAM ─────────────────────────────────────────────────────
+@bot.message_handler(commands=['start'])
+async def cmd_start(message):
+    name = message.from_user.first_name or "usuario"
+    g_all_chats.add(message.chat.id)
+
+    stats     = get_quota_stats(200)
+    stats_blk = quota_stats_text(stats)
+    data_info = (
+        f"📡 `{len(g_mults)}/400` multiplicadores recopilados"
+        if g_mults else
+        "📡 Recopilando datos en tiempo real..."
+    )
+
+    await bot.reply_to(
+        message,
+        f"🚀 *¡Bienvenido {name}!*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 *Bot de Señales Crash (Stake)*\n"
+        "📊 Sistema Moderado | Objetivo: `2.00x`\n"
+        "🔄 Gestión: 3 Columnas × 2 Intentos\n"
+        f"💵 Apuesta base fija: `${BASE_BET:.2f}`\n"
+        "🏆 Ciclo: 10 señales exitosas\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{data_info}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{stats_blk}"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ *¡Registrado!*\n"
+        "_Recibirás señales automáticamente_\n"
+        "_cuando la tendencia sea favorable._",
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(commands=['estadisticas'])
+async def cmd_estadisticas(message):
+    g_all_chats.add(message.chat.id)
+
+    s      = g_session
+    stats  = get_quota_stats(200)
+    trend  = quota_stats_text(stats)
+
+    fichas_recientes = s.fichas[-15:]
+    if fichas_recientes:
+        lineas = []
+        for f in fichas_recientes:
+            c1    = f['c1']
+            c2    = f['c2']
+            c3    = f['c3']
+            total = c1 + c2 + c3
+            net   = BASE_BET if f['result'] == 'win' else -total
+            res   = "✅" if f['result'] == 'win' else "❌"
+            hora  = f.get('ts', '--:--')
+
+            partes = [f"C1:${c1:.2f}"]
+            if c2 > 0:
+                partes.append(f"C2:${c2:.2f}")
+            if c3 > 0:
+                partes.append(f"C3:${c3:.2f}")
+            cols_txt = " ".join(partes)
+
+            net_txt = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
+            lineas.append(f"{res} #{f['n']} {hora} | {cols_txt} | {net_txt}")
+
+        fichas_txt   = "\n".join(lineas)
+        total_fichas = len(s.fichas)
+        wins_f  = sum(1 for f in s.fichas if f['result'] == 'win')
+        loss_f  = sum(1 for f in s.fichas if f['result'] == 'loss')
+        resumen = f"Total fichas: `{total_fichas}` | ✅ `{wins_f}` | ❌ `{loss_f}`"
+    else:
+        fichas_txt = "_Sin fichas registradas aún._"
+        resumen    = "Total fichas: `0`"
+
+    # Info del poller
+    poller_info = (
+        f"🌐 Requests API: `{g_poller_status['total_requests']}` | "
+        f"Giros nuevos: `{g_poller_status['total_new_rounds']}`"
+    )
+
+    await bot.reply_to(
+        message,
+        "📊 *ESTADÍSTICAS DEL BOT*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{s.status_short()}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{poller_info}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"*Últimas fichas (C1 + C2 + C3):*\n"
+        f"{fichas_txt}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{resumen}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trend}",
+        parse_mode='Markdown'
+    )
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+async def main_async():
+    logger.info("🤖 Iniciando CrashBot (Stake) — API HTTPS | Apuesta base $0.10")
+
+    await bot.set_my_commands([
+        types.BotCommand('start',        '🚀 Iniciar / Ver tendencia'),
+        types.BotCommand('estadisticas', '📊 Ver estadísticas'),
+    ])
+    logger.info("✅ Comandos configurados: /start y /estadisticas")
+
+    asyncio.create_task(http_poller())
+    asyncio.create_task(self_ping_loop())
+    logger.info("✅ Tareas de fondo iniciadas. Iniciando polling Telegram...")
+    await bot.infinity_polling(skip_pending=True)
+
+
+if __name__ == '__main__':
+    # Flask corre en hilo separado — Render hace health-check HTTP
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"🌐 Flask iniciado en puerto {os.environ.get('PORT', 8080)}")
+
+    # Loop async principal: bot Telegram + poller HTTP + self-ping
+    asyncio.run(main_async())
