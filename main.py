@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Immersive Roulette Stats Server v2
+Immersive Roulette Stats Server v3
 ===========================================================================
-CAMBIOS vs anterior:
-  - Única ruleta: IMMERSIVE ROULETTE (Evolution, HTTP polling)
-  - Fuente de datos: https://api-cs.casino.org/svc-evolution-game-events/api/immersiveroulette/latest
-  - Nuevas tablas: color_transitions, zone_transitions
-  - Detección de patrones de color (N/R) y zona (B/A) con secuencias reales
-  - Registro de aciertos/fallos por patrón para ML
-  - Endpoints extendidos: /stats/color, /stats/zone, /patterns/color, /patterns/zone
+CAMBIOS vs v2:
+  - Registro de aciertos/fallos de señales de DOCENAS y COLUMNAS
+    (enviadas por el bot vía POST /signals/{roulette}/dozen|column)
+  - Auto-resolución en cada spin (igual que color/zone patterns)
+  - Stats por último número: efectividad histórica de señales según el
+    número anterior al resultado
+  - Expuesto en /latest/{roulette}: dozen_signals, column_signals
+  - Endpoints: POST /signals/{roulette}/dozen
+               POST /signals/{roulette}/column
+               GET  /signals/{roulette}/dozen
+               GET  /signals/{roulette}/column
 """
 
 import asyncio
@@ -65,7 +69,7 @@ def get_color(n: int) -> str:
     return COLOR_MAP.get(n, "V")
 
 def get_zone(n: int) -> str:
-    if n == 0: return "0"
+    if n == 0: return "Z"
     return "B" if n <= 18 else "A"
 
 def get_dozen(n: int) -> int:
@@ -188,6 +192,74 @@ class DBPool:
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_zph_pid ON zone_pattern_history(pattern_id)")
 
+        # ── Señales de DOCENAS (registradas por el bot) ───────────────────────
+        # El bot envía POST /signals/{roulette}/dozen al activar una señal.
+        # El servidor la resuelve automáticamente en el siguiente spin.
+        conn.execute("""CREATE TABLE IF NOT EXISTS dozen_signal_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy    TEXT    NOT NULL,
+            pair_json   TEXT    NOT NULL,
+            missing     INTEGER NOT NULL,
+            prob        REAL    NOT NULL,
+            last_number INTEGER NOT NULL,
+            next_number INTEGER,
+            next_dozen  INTEGER,
+            result      TEXT,
+            ts          INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dsh_ln ON dozen_signal_history(last_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dsh_res ON dozen_signal_history(result)")
+
+        # ── Señales de COLUMNAS (registradas por el bot) ──────────────────────
+        conn.execute("""CREATE TABLE IF NOT EXISTS column_signal_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy     TEXT    NOT NULL,
+            pair_json    TEXT    NOT NULL,
+            missing      INTEGER NOT NULL,
+            prob         REAL    NOT NULL,
+            last_number  INTEGER NOT NULL,
+            next_number  INTEGER,
+            next_column  INTEGER,
+            result       TEXT,
+            ts           INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_csh_ln ON column_signal_history(last_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_csh_res ON column_signal_history(result)")
+
+        # ── Patrones de secuencia DOCENAS (últimos 5 no-cero = 2 docenas) ─────
+        # pattern_str: "D1,D1,D2,D1,D2"  numbers_json: [2,5,16,9,15]
+        # last_number: último número del patrón (el que completó los 5)
+        conn.execute("""CREATE TABLE IF NOT EXISTS dozen_seq_patterns (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_json    TEXT    NOT NULL,
+            missing      INTEGER NOT NULL,
+            pattern_str  TEXT    NOT NULL,
+            numbers_json TEXT    NOT NULL,
+            last_number  INTEGER NOT NULL,
+            next_number  INTEGER,
+            next_dozen   INTEGER,
+            result       TEXT,
+            ts           INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dsp_ln  ON dozen_seq_patterns(last_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dsp_res ON dozen_seq_patterns(result)")
+
+        # ── Patrones de secuencia COLUMNAS (últimos 5 no-cero = 2 columnas) ───
+        conn.execute("""CREATE TABLE IF NOT EXISTS column_seq_patterns (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair_json    TEXT    NOT NULL,
+            missing      INTEGER NOT NULL,
+            pattern_str  TEXT    NOT NULL,
+            numbers_json TEXT    NOT NULL,
+            last_number  INTEGER NOT NULL,
+            next_number  INTEGER,
+            next_column  INTEGER,
+            result       TEXT,
+            ts           INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_csp_ln  ON column_seq_patterns(last_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_csp_res ON column_seq_patterns(result)")
+
         conn.commit()
         conn.close()
         logger.info(f"✅ DB inicializada: {self.db_path}")
@@ -247,6 +319,12 @@ class StatsEngine:
         # Señales pendientes de resolución (esperan el siguiente número)
         self.pending_color: Optional[dict] = None   # {pid, p_str, bet, sequence, row_id}
         self.pending_zone:  Optional[dict] = None
+        self.pending_dozen_signal:  Optional[dict] = None  # {row_id, strategy, pair, missing, last_number}
+        self.pending_column_signal: Optional[dict] = None
+
+        # Patrones de secuencia (2 docenas / 2 columnas en últimos 5 no-cero)
+        self.pending_dozen_seq:  Optional[dict] = None  # {row_id, pair, missing, pattern_str, numbers, last_number}
+        self.pending_column_seq: Optional[dict] = None
 
         # Clientes WebSocket suscritos
         self.ws_clients: dict = {}
@@ -306,6 +384,80 @@ class StatsEngine:
                     "row_id":   row["id"],
                 }
                 logger.info(f"[ZONA] Señal pendiente cargada: {row['bet']} (patrón {row['pattern_id']})")
+
+            # Señal de DOCENA pendiente (enviada por el bot)
+            row = conn.execute(
+                "SELECT id, strategy, pair_json, missing, last_number "
+                "FROM dozen_signal_history WHERE result IS NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                self.pending_dozen_signal = {
+                    "row_id":      row["id"],
+                    "strategy":    row["strategy"],
+                    "pair":        json.loads(row["pair_json"]),
+                    "missing":     row["missing"],
+                    "last_number": row["last_number"],
+                }
+                logger.info(
+                    f"[DOCENA] Señal pendiente cargada: par={row['pair_json']} "
+                    f"last={row['last_number']}"
+                )
+
+            # Señal de COLUMNA pendiente (enviada por el bot)
+            row = conn.execute(
+                "SELECT id, strategy, pair_json, missing, last_number "
+                "FROM column_signal_history WHERE result IS NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                self.pending_column_signal = {
+                    "row_id":      row["id"],
+                    "strategy":    row["strategy"],
+                    "pair":        json.loads(row["pair_json"]),
+                    "missing":     row["missing"],
+                    "last_number": row["last_number"],
+                }
+                logger.info(
+                    f"[COLUMNA] Señal pendiente cargada: par={row['pair_json']} "
+                    f"last={row['last_number']}"
+                )
+
+            # Patrón de secuencia de DOCENAS pendiente
+            row = conn.execute(
+                "SELECT id, pair_json, missing, pattern_str, numbers_json, last_number "
+                "FROM dozen_seq_patterns WHERE result IS NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                self.pending_dozen_seq = {
+                    "row_id":      row["id"],
+                    "pair":        json.loads(row["pair_json"]),
+                    "missing":     row["missing"],
+                    "pattern_str": row["pattern_str"],
+                    "numbers":     json.loads(row["numbers_json"]),
+                    "last_number": row["last_number"],
+                }
+                logger.info(
+                    f"[D-SEQ] Patrón pendiente cargado: [{row['pattern_str']}] "
+                    f"par={row['pair_json']} last={row['last_number']}"
+                )
+
+            # Patrón de secuencia de COLUMNAS pendiente
+            row = conn.execute(
+                "SELECT id, pair_json, missing, pattern_str, numbers_json, last_number "
+                "FROM column_seq_patterns WHERE result IS NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                self.pending_column_seq = {
+                    "row_id":      row["id"],
+                    "pair":        json.loads(row["pair_json"]),
+                    "missing":     row["missing"],
+                    "pattern_str": row["pattern_str"],
+                    "numbers":     json.loads(row["numbers_json"]),
+                    "last_number": row["last_number"],
+                }
+                logger.info(
+                    f"[C-SEQ] Patrón pendiente cargado: [{row['pattern_str']}] "
+                    f"par={row['pair_json']} last={row['last_number']}"
+                )
         finally:
             conn.close()
 
@@ -364,6 +516,11 @@ class StatsEngine:
         # 5. Resolver señales pendientes con el número actual
         await self._resolve_pending_color(number, color)
         await self._resolve_pending_zone(number, zone)
+        await self._resolve_pending_dozen_signal(number, d, c)
+        await self._resolve_pending_column_signal(number, d, c)
+        # Resolver patrones de secuencia (antes de actualizar secuencias)
+        await self._resolve_pending_dozen_seq(number, d)
+        await self._resolve_pending_column_seq(number, c)
 
         # 6. Actualizar secuencias en memoria
         self.number_seq.append(number)
@@ -377,6 +534,9 @@ class StatsEngine:
         # 7. Detectar nuevos patrones
         await self._detect_color_pattern()
         await self._detect_zone_pattern()
+        # Detectar patrones de secuencia (después de actualizar secuencias)
+        await self._detect_dozen_seq_pattern(number)
+        await self._detect_column_seq_pattern(number)
 
         # 8. Actualizar estado
         self.last_number  = number
@@ -426,6 +586,235 @@ class StatsEngine:
             f"bet={bet} | cayó #{number}({zone}) → {result}"
         )
         self.pending_zone = None
+
+    # ── Resolución señales DOCENAS/COLUMNAS ───────────────────────────────────
+    async def _resolve_pending_dozen_signal(self, number: int, dozen: int, column: int):
+        """Resuelve la señal de docena pendiente con el número recién caído."""
+        if not self.pending_dozen_signal:
+            return
+        pair   = self.pending_dozen_signal["pair"]
+        result = "Acierto" if (dozen != 0 and dozen in pair) else "Fallo"
+        await db.write(
+            "UPDATE dozen_signal_history SET next_number=?, next_dozen=?, result=? WHERE id=?",
+            (number, dozen, result, self.pending_dozen_signal["row_id"])
+        )
+        icon = "✅" if result == "Acierto" else "❌"
+        logger.info(
+            f"[DOCENA] {icon} par={pair} → cayó #{number}(D{dozen}) → {result} "
+            f"[last={self.pending_dozen_signal['last_number']}]"
+        )
+        self.pending_dozen_signal = None
+
+    async def _resolve_pending_column_signal(self, number: int, dozen: int, column: int):
+        """Resuelve la señal de columna pendiente con el número recién caído."""
+        if not self.pending_column_signal:
+            return
+        pair   = self.pending_column_signal["pair"]
+        result = "Acierto" if (column != 0 and column in pair) else "Fallo"
+        await db.write(
+            "UPDATE column_signal_history SET next_number=?, next_column=?, result=? WHERE id=?",
+            (number, column, result, self.pending_column_signal["row_id"])
+        )
+        icon = "✅" if result == "Acierto" else "❌"
+        logger.info(
+            f"[COLUMNA] {icon} par={pair} → cayó #{number}(C{column}) → {result} "
+            f"[last={self.pending_column_signal['last_number']}]"
+        )
+        self.pending_column_signal = None
+
+    # ── Detección y resolución de patrones de SECUENCIA (2D / 2C en últimos 5) ─
+
+    async def _detect_dozen_seq_pattern(self, current_number: int):
+        """Detecta si los últimos 5 números no-cero forman un patrón de 2 docenas.
+
+        Ejemplo: secuencia [2,5,16,9,15] → docenas [D1,D1,D2,D1,D2] → par (1,2)
+        """
+        if self.pending_dozen_seq:
+            return  # Ya hay un patrón pendiente de resolución
+
+        # Pares (número, docena) de los no-cero en memoria
+        nz = [
+            (self.number_seq[i], (self.number_seq[i] - 1) // 12 + 1)
+            for i in range(len(self.number_seq))
+            if self.number_seq[i] != 0
+        ]
+        if len(nz) < 5:
+            return
+
+        last5_nums, last5_dozens = zip(*nz[-5:])
+        unique_dozens = set(last5_dozens)
+
+        if len(unique_dozens) != 2:
+            return  # Necesitamos exactamente 2 docenas distintas
+
+        pair    = sorted(unique_dozens)
+        missing = list({1, 2, 3} - set(pair))[0]
+        pattern_str  = ",".join(f"D{d}" for d in last5_dozens)
+        numbers_json = list(last5_nums)
+        last_number  = current_number  # número que completó el patrón
+
+        row_id = await db.write(
+            "INSERT INTO dozen_seq_patterns"
+            "(pair_json, missing, pattern_str, numbers_json, last_number, ts) "
+            "VALUES(?,?,?,?,?,?)",
+            (json.dumps(pair), missing, pattern_str,
+             json.dumps(numbers_json), last_number, int(time.time())),
+            get_lastrowid=True
+        )
+        self.pending_dozen_seq = {
+            "row_id":      row_id,
+            "pair":        pair,
+            "missing":     missing,
+            "pattern_str": pattern_str,
+            "numbers":     numbers_json,
+            "last_number": last_number,
+        }
+        logger.info(
+            f"[D-SEQ] 🔔 Patrón: [{pattern_str}] → D{pair} | falta D{missing} "
+            f"| nums={numbers_json} | last={last_number}"
+        )
+
+    async def _detect_column_seq_pattern(self, current_number: int):
+        """Detecta si los últimos 5 números no-cero forman un patrón de 2 columnas.
+
+        Ejemplo: secuencia [1,4,7,10,13] → columnas [C1,C1,C1,C1,C1] → no aplica (3 necesarias)
+        Ejemplo: [1,2,4,5,7] → columnas [C1,C2,C1,C2,C1] → par (1,2)
+        """
+        if self.pending_column_seq:
+            return
+
+        nz = [
+            (self.number_seq[i], ((self.number_seq[i] - 1) % 3) + 1)
+            for i in range(len(self.number_seq))
+            if self.number_seq[i] != 0
+        ]
+        if len(nz) < 5:
+            return
+
+        last5_nums, last5_cols = zip(*nz[-5:])
+        unique_cols = set(last5_cols)
+
+        if len(unique_cols) != 2:
+            return
+
+        pair    = sorted(unique_cols)
+        missing = list({1, 2, 3} - set(pair))[0]
+        pattern_str  = ",".join(f"C{c}" for c in last5_cols)
+        numbers_json = list(last5_nums)
+        last_number  = current_number
+
+        row_id = await db.write(
+            "INSERT INTO column_seq_patterns"
+            "(pair_json, missing, pattern_str, numbers_json, last_number, ts) "
+            "VALUES(?,?,?,?,?,?)",
+            (json.dumps(pair), missing, pattern_str,
+             json.dumps(numbers_json), last_number, int(time.time())),
+            get_lastrowid=True
+        )
+        self.pending_column_seq = {
+            "row_id":      row_id,
+            "pair":        pair,
+            "missing":     missing,
+            "pattern_str": pattern_str,
+            "numbers":     numbers_json,
+            "last_number": last_number,
+        }
+        logger.info(
+            f"[C-SEQ] 🔔 Patrón: [{pattern_str}] → C{pair} | falta C{missing} "
+            f"| nums={numbers_json} | last={last_number}"
+        )
+
+    async def _resolve_pending_dozen_seq(self, number: int, dozen: int):
+        """Resuelve el patrón de secuencia de docenas con el número recién caído."""
+        if not self.pending_dozen_seq:
+            return
+        pair   = self.pending_dozen_seq["pair"]
+        result = "Acierto" if (dozen != 0 and dozen in pair) else "Fallo"
+        await db.write(
+            "UPDATE dozen_seq_patterns SET next_number=?, next_dozen=?, result=? WHERE id=?",
+            (number, dozen, result, self.pending_dozen_seq["row_id"])
+        )
+        icon = "✅" if result == "Acierto" else "❌"
+        logger.info(
+            f"[D-SEQ] {icon} par=D{pair} → cayó #{number}(D{dozen}) → {result} "
+            f"[seq={self.pending_dozen_seq['numbers']} last={self.pending_dozen_seq['last_number']}]"
+        )
+        self.pending_dozen_seq = None
+
+    async def _resolve_pending_column_seq(self, number: int, column: int):
+        """Resuelve el patrón de secuencia de columnas con el número recién caído."""
+        if not self.pending_column_seq:
+            return
+        pair   = self.pending_column_seq["pair"]
+        result = "Acierto" if (column != 0 and column in pair) else "Fallo"
+        await db.write(
+            "UPDATE column_seq_patterns SET next_number=?, next_column=?, result=? WHERE id=?",
+            (number, column, result, self.pending_column_seq["row_id"])
+        )
+        icon = "✅" if result == "Acierto" else "❌"
+        logger.info(
+            f"[C-SEQ] {icon} par=C{pair} → cayó #{number}(C{column}) → {result} "
+            f"[seq={self.pending_column_seq['numbers']} last={self.pending_column_seq['last_number']}]"
+        )
+        self.pending_column_seq = None
+
+    # ── Registro de señales desde el bot ─────────────────────────────────────
+    async def register_dozen_signal(
+        self, strategy: str, pair: list, missing: int, prob: float, last_number: int
+    ) -> int:
+        """El bot llama a POST /signals/IMMERSIVE/dozen al activar una señal."""
+        if self.pending_dozen_signal:
+            logger.warning(
+                f"[DOCENA] ⚠️ Señal anterior sin resolver (id={self.pending_dozen_signal['row_id']}) "
+                f"→ marcada como Cancelada"
+            )
+            await db.write(
+                "UPDATE dozen_signal_history SET result='Cancelada' WHERE id=?",
+                (self.pending_dozen_signal["row_id"],)
+            )
+        row_id = await db.write(
+            "INSERT INTO dozen_signal_history"
+            "(strategy, pair_json, missing, prob, last_number, ts) VALUES(?,?,?,?,?,?)",
+            (strategy, json.dumps(pair), missing, round(prob, 6), last_number, int(time.time())),
+            get_lastrowid=True
+        )
+        self.pending_dozen_signal = {
+            "row_id": row_id, "strategy": strategy,
+            "pair": pair, "missing": missing, "last_number": last_number,
+        }
+        logger.info(
+            f"[DOCENA] 🎯 Señal registrada: strat={strategy} par={pair} "
+            f"missing={missing} prob={prob:.0%} last={last_number}"
+        )
+        return row_id
+
+    async def register_column_signal(
+        self, strategy: str, pair: list, missing: int, prob: float, last_number: int
+    ) -> int:
+        """El bot llama a POST /signals/IMMERSIVE/column al activar una señal."""
+        if self.pending_column_signal:
+            logger.warning(
+                f"[COLUMNA] ⚠️ Señal anterior sin resolver → marcada como Cancelada"
+            )
+            await db.write(
+                "UPDATE column_signal_history SET result='Cancelada' WHERE id=?",
+                (self.pending_column_signal["row_id"],)
+            )
+        row_id = await db.write(
+            "INSERT INTO column_signal_history"
+            "(strategy, pair_json, missing, prob, last_number, ts) VALUES(?,?,?,?,?,?)",
+            (strategy, json.dumps(pair), missing, round(prob, 6), last_number, int(time.time())),
+            get_lastrowid=True
+        )
+        self.pending_column_signal = {
+            "row_id": row_id, "strategy": strategy,
+            "pair": pair, "missing": missing, "last_number": last_number,
+        }
+        logger.info(
+            f"[COLUMNA] 🎯 Señal registrada: strat={strategy} par={pair} "
+            f"missing={missing} prob={prob:.0%} last={last_number}"
+        )
+        return row_id
 
     # ── Detección de patrones ─────────────────────────────────────────────────
     async def _detect_color_pattern(self):
@@ -477,7 +866,7 @@ class StatsEngine:
         non_zero_zones = [
             self.zone_seq[i]
             for i in range(len(self.zone_seq))
-            if self.zone_seq[i] != "0"
+            if self.zone_seq[i] != "Z"
         ]
         matched = check_patterns(non_zero_zones, ZONE_PATTERNS)
         if not matched:
@@ -487,7 +876,7 @@ class StatsEngine:
         nz_nums  = [
             self.number_seq[i]
             for i in range(len(self.number_seq))
-            if self.zone_seq[i] != "0"
+            if self.zone_seq[i] != "Z"
         ]
         seq_nums = nz_nums[-plen:] if len(nz_nums) >= plen else nz_nums
         p_str    = ",".join(matched["p"])
@@ -649,6 +1038,151 @@ class StatsEngine:
             summary[pid]["efectividad"] = round(summary[pid]["aciertos"]/t*100, 1) if t else 0
         return summary
 
+    # ── Stats de señales de DOCENAS/COLUMNAS ─────────────────────────────────
+    async def get_signal_summary(self, kind: str) -> dict:
+        """Resumen global de aciertos/fallos de señales (dozen | column)."""
+        table = "dozen_signal_history" if kind == "dozen" else "column_signal_history"
+        rows  = await db.fetch(
+            f"SELECT strategy, result FROM {table} WHERE result IN ('Acierto','Fallo')"
+        )
+        aciertos = sum(1 for r in rows if r["result"] == "Acierto")
+        fallos   = sum(1 for r in rows if r["result"] == "Fallo")
+        total    = aciertos + fallos
+        # Por estrategia
+        by_strat: Dict[str, dict] = {}
+        for r in rows:
+            s = r["strategy"]
+            if s not in by_strat:
+                by_strat[s] = {"aciertos": 0, "fallos": 0, "total": 0}
+            by_strat[s]["total"] += 1
+            if r["result"] == "Acierto":
+                by_strat[s]["aciertos"] += 1
+            else:
+                by_strat[s]["fallos"] += 1
+        for s in by_strat:
+            t = by_strat[s]["total"]
+            by_strat[s]["efectividad"] = round(by_strat[s]["aciertos"]/t*100, 1) if t else 0.0
+        return {
+            "aciertos":   aciertos,
+            "fallos":     fallos,
+            "total":      total,
+            "efectividad": round(aciertos/total*100, 1) if total > 0 else 0.0,
+            "por_estrategia": by_strat,
+        }
+
+    async def get_signal_stats_by_number(self, kind: str) -> dict:
+        """Aciertos/fallos indexados por last_number (el número anterior a la señal)."""
+        table = "dozen_signal_history" if kind == "dozen" else "column_signal_history"
+        rows  = await db.fetch(
+            f"SELECT last_number, result FROM {table} WHERE result IN ('Acierto','Fallo')"
+        )
+        stats: Dict[str, dict] = {}
+        for r in rows:
+            key = str(r["last_number"])
+            if key not in stats:
+                stats[key] = {"aciertos": 0, "fallos": 0, "total": 0, "efectividad": 0.0}
+            stats[key]["total"] += 1
+            if r["result"] == "Acierto":
+                stats[key]["aciertos"] += 1
+            else:
+                stats[key]["fallos"] += 1
+        for key in stats:
+            t = stats[key]["total"]
+            stats[key]["efectividad"] = round(stats[key]["aciertos"]/t*100, 1) if t else 0.0
+        return stats
+
+    # ── Stats de patrones de SECUENCIA (2D / 2C) ─────────────────────────────
+
+    async def get_seq_pattern_history(self, kind: str, limit: int = 100) -> List[dict]:
+        """Historial de patrones de secuencia resueltos.
+        kind = 'dozen' | 'column'
+        Devuelve registros con: pair, missing, pattern, numbers, last_number,
+                                next_number, next_cat, result, ts
+        """
+        table   = "dozen_seq_patterns"   if kind == "dozen" else "column_seq_patterns"
+        nxt_col = "next_dozen"           if kind == "dozen" else "next_column"
+        rows = await db.fetch(
+            f"SELECT pair_json, missing, pattern_str, numbers_json, last_number, "
+            f"next_number, {nxt_col} AS next_cat, result, ts "
+            f"FROM {table} WHERE result IS NOT NULL "
+            f"ORDER BY id DESC LIMIT ?",
+            (limit,)
+        )
+        result = []
+        for r in rows:
+            result.append({
+                "pair":        json.loads(r["pair_json"]),
+                "missing":     r["missing"],
+                "pattern":     r["pattern_str"],
+                "numbers":     json.loads(r["numbers_json"]),
+                "last_number": r["last_number"],
+                "next_number": r["next_number"],
+                "next_cat":    r["next_cat"],
+                "result":      r["result"],
+                "ts":          r["ts"],
+            })
+        return result
+
+    async def get_seq_pattern_stats_by_number(self, kind: str) -> dict:
+        """Estadísticas de patrones de secuencia indexadas por last_number.
+
+        Para cada last_number devuelve:
+          - aciertos/fallos/total/efectividad global
+          - pairs: cada par con sus conteos y efectividad
+          - top_pair: el par más frecuente (con su efectividad propia)
+
+        Permite al bot saber: "cuando el último número fue 17,
+        qué par de docenas/columnas salió más y con qué win rate".
+        """
+        table = "dozen_seq_patterns" if kind == "dozen" else "column_seq_patterns"
+        rows  = await db.fetch(
+            f"SELECT last_number, pair_json, result FROM {table} "
+            f"WHERE result IN ('Acierto','Fallo')"
+        )
+
+        by_num: Dict[str, dict] = {}
+        for r in rows:
+            key  = str(r["last_number"])
+            pair = tuple(sorted(json.loads(r["pair_json"])))
+            pk   = f"{pair[0]},{pair[1]}"
+
+            if key not in by_num:
+                by_num[key] = {"aciertos": 0, "fallos": 0, "total": 0,
+                               "efectividad": 0.0, "_pairs": {}}
+
+            by_num[key]["total"] += 1
+            if pk not in by_num[key]["_pairs"]:
+                by_num[key]["_pairs"][pk] = {
+                    "pair": list(pair), "count": 0,
+                    "aciertos": 0, "fallos": 0, "efectividad": 0.0
+                }
+            by_num[key]["_pairs"][pk]["count"] += 1
+
+            if r["result"] == "Acierto":
+                by_num[key]["aciertos"] += 1
+                by_num[key]["_pairs"][pk]["aciertos"] += 1
+            else:
+                by_num[key]["fallos"] += 1
+                by_num[key]["_pairs"][pk]["fallos"] += 1
+
+        # Post-process: efectividades y top_pair
+        for key, data in by_num.items():
+            t = data["total"]
+            data["efectividad"] = round(data["aciertos"] / t * 100, 1) if t else 0.0
+
+            pairs_dict = data["_pairs"]
+            for pk, pdata in pairs_dict.items():
+                pt = pdata["count"]
+                pdata["efectividad"] = round(pdata["aciertos"] / pt * 100, 1) if pt else 0.0
+
+            if pairs_dict:
+                top_pk = max(pairs_dict, key=lambda x: pairs_dict[x]["count"])
+                data["top_pair"] = pairs_dict[top_pk]
+                data["pairs"]    = pairs_dict
+            del data["_pairs"]
+
+        return by_num
+
     async def get_latest_data(self) -> dict:
         """Todo en una consulta para el polling del bot."""
         total        = await self.get_total_spins()
@@ -661,6 +1195,18 @@ class StatsEngine:
         zone_hist    = await self.get_pattern_history("zone", 50)
         color_sum    = await self.get_pattern_summary("color")
         zone_sum     = await self.get_pattern_summary("zone")
+
+        # Señales de docenas y columnas (aciertos/fallos)
+        dozen_sum     = await self.get_signal_summary("dozen")
+        dozen_by_num  = await self.get_signal_stats_by_number("dozen")
+        column_sum    = await self.get_signal_summary("column")
+        column_by_num = await self.get_signal_stats_by_number("column")
+
+        # ── Patrones de secuencia 2D / 2C ─────────────────────────────────────
+        dozen_seq_hist   = await self.get_seq_pattern_history("dozen", 60)
+        dozen_seq_by_num = await self.get_seq_pattern_stats_by_number("dozen")
+        col_seq_hist     = await self.get_seq_pattern_history("column", 60)
+        col_seq_by_num   = await self.get_seq_pattern_stats_by_number("column")
 
         return {
             "roulette":       ROULETTE,
@@ -680,6 +1226,32 @@ class StatsEngine:
                 "pending":   self.pending_zone,
                 "history":   zone_hist,
                 "summary":   zone_sum,
+            },
+            # ── Señales bot de docenas y columnas ────────────────────────────
+            "dozen_signals": {
+                "pending":   self.pending_dozen_signal,
+                "summary":   dozen_sum,
+                "by_number": dozen_by_num,
+            },
+            "column_signals": {
+                "pending":   self.pending_column_signal,
+                "summary":   column_sum,
+                "by_number": column_by_num,
+            },
+            # ── Patrones de secuencia (2 docenas / 2 columnas en últimos 5) ──
+            # Estructura:
+            #   pending: patrón activo sin resolver
+            #   history: últimos 60 resueltos con números reales y resultado
+            #   by_number: por cada last_number → top_pair, efectividad, pairs
+            "dozen_seq_patterns": {
+                "pending":   self.pending_dozen_seq,
+                "history":   dozen_seq_hist,
+                "by_number": dozen_seq_by_num,
+            },
+            "column_seq_patterns": {
+                "pending":   self.pending_column_seq,
+                "history":   col_seq_hist,
+                "by_number": col_seq_by_num,
             },
         }
 
@@ -778,6 +1350,74 @@ async def handle_patterns_zone(request):
         "pending": engine.pending_zone,
         "summary": summary,
         "history": history,
+    })
+
+# ─── HANDLERS SEÑALES DOCENAS / COLUMNAS ──────────────────────────────────────
+
+async def handle_signal_dozen_post(request):
+    """POST /signals/{roulette}/dozen — Bot registra señal de docena activa."""
+    key = request.match_info.get("roulette", "").upper()
+    if key != ROULETTE:
+        return web.json_response({"error": f"Solo disponible: {ROULETTE}"}, status=404)
+    try:
+        data       = await request.json()
+        strategy   = str(data.get("strategy", ""))
+        pair       = list(data.get("pair", []))
+        missing    = int(data.get("missing", 0))
+        prob       = float(data.get("prob", 0.0))
+        last_number = int(data.get("last_number", 0))
+        if not pair:
+            return web.json_response({"error": "pair requerido"}, status=400)
+        row_id = await engine.register_dozen_signal(strategy, pair, missing, prob, last_number)
+        return web.json_response({"ok": True, "row_id": row_id})
+    except Exception as e:
+        logger.error(f"❌ Error registrando señal docena: {e}")
+        return web.json_response({"error": str(e)}, status=400)
+
+async def handle_signal_column_post(request):
+    """POST /signals/{roulette}/column — Bot registra señal de columna activa."""
+    key = request.match_info.get("roulette", "").upper()
+    if key != ROULETTE:
+        return web.json_response({"error": f"Solo disponible: {ROULETTE}"}, status=404)
+    try:
+        data       = await request.json()
+        strategy   = str(data.get("strategy", ""))
+        pair       = list(data.get("pair", []))
+        missing    = int(data.get("missing", 0))
+        prob       = float(data.get("prob", 0.0))
+        last_number = int(data.get("last_number", 0))
+        if not pair:
+            return web.json_response({"error": "pair requerido"}, status=400)
+        row_id = await engine.register_column_signal(strategy, pair, missing, prob, last_number)
+        return web.json_response({"ok": True, "row_id": row_id})
+    except Exception as e:
+        logger.error(f"❌ Error registrando señal columna: {e}")
+        return web.json_response({"error": str(e)}, status=400)
+
+async def handle_signal_dozen_get(request):
+    """GET /signals/{roulette}/dozen — Estadísticas de señales de docenas."""
+    key = request.match_info.get("roulette", "").upper()
+    if key != ROULETTE:
+        return web.json_response({"error": f"Solo disponible: {ROULETTE}"}, status=404)
+    summary  = await engine.get_signal_summary("dozen")
+    by_number = await engine.get_signal_stats_by_number("dozen")
+    return web.json_response({
+        "pending":   engine.pending_dozen_signal,
+        "summary":   summary,
+        "by_number": by_number,
+    })
+
+async def handle_signal_column_get(request):
+    """GET /signals/{roulette}/column — Estadísticas de señales de columnas."""
+    key = request.match_info.get("roulette", "").upper()
+    if key != ROULETTE:
+        return web.json_response({"error": f"Solo disponible: {ROULETTE}"}, status=404)
+    summary   = await engine.get_signal_summary("column")
+    by_number = await engine.get_signal_stats_by_number("column")
+    return web.json_response({
+        "pending":   engine.pending_column_signal,
+        "summary":   summary,
+        "by_number": by_number,
     })
 
 async def handle_spins(request):
@@ -924,6 +1564,10 @@ def create_app() -> web.Application:
     app.router.add_get("/stats/{roulette}/zone",      handle_stats_zone)
     app.router.add_get("/patterns/{roulette}/color",  handle_patterns_color)
     app.router.add_get("/patterns/{roulette}/zone",   handle_patterns_zone)
+    app.router.add_post("/signals/{roulette}/dozen",  handle_signal_dozen_post)
+    app.router.add_post("/signals/{roulette}/column", handle_signal_column_post)
+    app.router.add_get("/signals/{roulette}/dozen",   handle_signal_dozen_get)
+    app.router.add_get("/signals/{roulette}/column",  handle_signal_column_get)
     app.router.add_get("/spins/{roulette}/{n}",       handle_spins)
     app.router.add_get("/ws",                         handle_websocket)
     app.on_startup.append(start_tasks)
