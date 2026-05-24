@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Immersive Roulette Stats Server v3
@@ -22,6 +21,7 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
 import aiohttp
@@ -37,22 +37,12 @@ for _ln in ["aiohttp.access", "aiohttp.server", "urllib3"]:
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 EVOLUTION_URL   = "https://api-cs.casino.org/svc-evolution-game-events/api/immersiveroulette/latest"
+POLL_SECS       = 1
 RENDER_URL      = os.environ.get("RENDER_EXTERNAL_URL", "")
 STATS_DB        = "immersive_stats.db"
 MAX_STORED      = 500
 ROULETTE        = "IMMERSIVE"
 ROULETTE_NAME   = "Immersive Roulette"
-
-# Ciclo de polling en dos fases:
-#   WAIT_SECS      → tiempo de reposo tras registrar un giro (los ~22 s que tarda
-#                    la ruleta en completar la siguiente tirada)
-#   BURST_INTERVAL → intervalo de consulta en modo "burst" (detección rápida
-#                    del nuevo giro en cuanto la API lo publica)
-#   BURST_TIMEOUT  → máximo tiempo en modo burst antes de reiniciar el ciclo;
-#                    cubre el caso de que el giro tarde más de lo esperado (>30 s)
-WAIT_SECS      = 22    # segundos de espera entre giros
-BURST_INTERVAL = 1.5   # segundos entre consultas en modo burst
-BURST_TIMEOUT  = 20    # segundos máximos buscando el nuevo giro
 
 EVOLUTION_HEADERS = {
     "origin":           "https://www.casino.org",
@@ -90,6 +80,16 @@ def get_dozen(n: int) -> int:
 def get_column(n: int) -> int:
     if n == 0: return 0
     return ((n - 1) % 3) + 1
+
+def parse_settled_at(s: str) -> float:
+    """Convierte el campo settledAt (ISO 8601) de la API de Evolution a Unix timestamp.
+    Devuelve 0.0 si el string está vacío o tiene formato inválido."""
+    if not s:
+        return 0.0
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 # ─── PATRONES ─────────────────────────────────────────────────────────────────
 COLOR_PATTERNS = [
@@ -1283,94 +1283,6 @@ class StatsEngine:
 
 engine = StatsEngine()
 
-# ─── SPIN GUARD (sistema anti-pérdida de giros) ───────────────────────────────
-class SpinGuard:
-    """
-    Protección ante fallos de la API dentro del ciclo burst:
-
-    1. Reintentos rápidos (QUICK_RETRIES x QUICK_WAIT s) antes de backoff.
-       Un 500 puntual se absorbe aqui sin interrumpir el modo burst.
-
-    2. Backoff exponencial si todos los reintentos fallan; se reinicia el
-       ciclo completo (espera + burst) desde el principio.
-
-    3. Detector de gap: si el tiempo entre dos giros registrados supera
-       MISS_THRESHOLD s, alerta de posible giro perdido y lo persiste en
-       la tabla spin_gap_alerts para auditoria.
-    """
-    QUICK_RETRIES  = 3     # reintentos rapidos por fallo dentro del burst
-    QUICK_WAIT     = 1.0   # segundos entre reintentos rapidos
-    MISS_THRESHOLD = 50    # gap (s) entre giros que dispara la alerta
-
-    def __init__(self):
-        self._consecutive  = 0
-        self._recon        = 5      # backoff actual en segundos
-        self.last_spin_ts  = 0.0
-        self.last_spin_num = None
-        self.missed_alerts = 0
-        self._init_db()
-
-    def _init_db(self):
-        conn = sqlite3.connect(db.db_path)
-        conn.execute("""CREATE TABLE IF NOT EXISTS spin_gap_alerts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            gap_secs    REAL    NOT NULL,
-            before_num  INTEGER,
-            after_num   INTEGER NOT NULL,
-            ts          INTEGER NOT NULL
-        )""")
-        conn.commit()
-        conn.close()
-
-    # ── estado ────────────────────────────────────────────────────────────────
-    @property
-    def in_error(self) -> bool:
-        return self._consecutive > 0
-
-    # ── eventos ───────────────────────────────────────────────────────────────
-    def on_success(self):
-        if self.in_error:
-            logger.info(
-                f"[SpinGuard] ✅ API recuperada tras {self._consecutive} errores"
-            )
-        self._consecutive = 0
-        self._recon       = 5
-
-    def on_error(self):
-        self._consecutive += 1
-        self._recon = min(self._recon * 2, 60)
-        logger.warning(
-            f"[SpinGuard] ❌ Error consecutivo #{self._consecutive} — "
-            f"proximo reintento en {self._recon}s"
-        )
-
-    async def check_gap(self, number: int):
-        """Alerta si el intervalo entre giros supera MISS_THRESHOLD."""
-        now = time.time()
-        if self.last_spin_ts > 0:
-            gap = now - self.last_spin_ts
-            if gap > self.MISS_THRESHOLD:
-                self.missed_alerts += 1
-                logger.warning(
-                    f"[SpinGuard] 🚨 Gap de {gap:.0f}s entre #{self.last_spin_num} "
-                    f"y #{number} — posible giro perdido (alerta #{self.missed_alerts})"
-                )
-                # Registrar en DB para auditoría posterior
-                try:
-                    conn = sqlite3.connect(db.db_path)
-                    conn.execute(
-                        "INSERT INTO spin_gap_alerts(gap_secs,before_num,after_num,ts) "
-                        "VALUES(?,?,?,?)",
-                        (round(gap, 2), self.last_spin_num, number, int(now))
-                    )
-                    conn.commit()
-                    conn.close()
-                except Exception as exc:
-                    logger.error(f"[SpinGuard] Error guardando gap_alert: {exc}")
-        self.last_spin_ts  = now
-        self.last_spin_num = number
-
-
 # ─── HTTP HANDLERS ────────────────────────────────────────────────────────────
 async def handle_home(request):
     total = await engine.get_total_spins()
@@ -1557,165 +1469,112 @@ async def handle_websocket(request):
     return ws
 
 # ─── POLLER EVOLUTION API ─────────────────────────────────────────────────────
-async def _fetch_evolution(session: aiohttp.ClientSession) -> Optional[dict]:
-    """
-    Intenta obtener el payload de Evolution.
-    Devuelve el dict si HTTP 200, None en cualquier otro caso.
-    No lanza excepciones — el llamador decide cómo actuar.
-    """
-    try:
-        async with session.get(
-            EVOLUTION_URL,
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json(content_type=None)
-            logger.warning(f"⚠️ API status: {resp.status}")
-            return None
-    except aiohttp.ClientError as e:
-        logger.warning(f"⚠️ Error de red: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Error inesperado en fetch: {e}")
-        return None
-
-
-async def _fetch_with_retries(
-    session: aiohttp.ClientSession,
-    guard: "SpinGuard",
-) -> Optional[dict]:
-    """
-    Fetch con reintentos rápidos integrados.
-    Devuelve el payload si algún intento tiene éxito, None si todos fallan.
-    Llama a guard.on_success() / guard.on_error() según corresponda.
-    """
-    payload = await _fetch_evolution(session)
-
-    if payload is None:
-        for attempt in range(1, SpinGuard.QUICK_RETRIES + 1):
-            await asyncio.sleep(SpinGuard.QUICK_WAIT)
-            payload = await _fetch_evolution(session)
-            if payload is not None:
-                logger.info(
-                    f"[SpinGuard] ♻️ Recuperado en reintento {attempt}/{SpinGuard.QUICK_RETRIES}"
-                )
-                break
-
-    if payload is not None:
-        guard.on_success()
-    else:
-        guard.on_error()
-
-    return payload
-
-
 async def poll_evolution():
     """
-    Poller de dos fases con SpinGuard integrado.
+    Poller original con timing adaptativo.
 
-    Ciclo por giro:
-      FASE 1 — ESPERA (WAIT_SECS = 22 s)
-        Reposo mientras la ruleta completa la tirada anterior.
-        Si la API falla aquí, reintenta con backoff pero NO rompe el ciclo:
-        simplemente retarda el inicio del burst.
-
-      FASE 2 — BURST (cada BURST_INTERVAL = 1.5 s, máx BURST_TIMEOUT = 20 s)
-        Consulta rápida hasta detectar un nuevo game_id con status=Resolved.
-        Cada intento fallido usa reintentos rápidos antes de contar el error.
-        Si el burst agota el timeout sin encontrar giro (tirada tardía o API caída),
-        vuelve a FASE 1 sin registrar nada — el SpinGuard habrá emitido alerta.
+    Lógica añadida (sin cambiar el flujo base):
+      - Parsea settledAt de cada payload para calcular el intervalo real entre giros.
+      - Tras registrar un giro, duerme el 80 % del intervalo calculado menos el
+        tiempo ya transcurrido desde que Evolution publicó el resultado.
+        Esto evita bombardear la API durante la ventana en que no puede haber
+        un giro nuevo, eliminando la exposición al error 500 recurrente.
+      - Al despertar (o sin intervalo conocido todavía) consulta cada POLL_SECS = 1 s
+        hasta detectar el siguiente giro.
+      - Fix: el backoff exponencial ahora aplica también a respuestas HTTP no-200
+        (antes solo se aplicaba a errores de red).
     """
-    guard   = SpinGuard()
-    last_id = engine.last_game_id
-    logger.info(
-        f"🎰 Poller Evolution iniciado — "
-        f"espera={WAIT_SECS}s | burst={BURST_INTERVAL}s | timeout={BURST_TIMEOUT}s"
-    )
+    recon           = 5
+    last_id         = engine.last_game_id
+    last_settled_ts = 0.0   # settledAt del último giro registrado (Unix ts)
+    spin_interval   = 0.0   # intervalo calculado entre los dos últimos giros
+
+    logger.info(f"🎰 Iniciando poller Evolution: {EVOLUTION_URL}")
 
     async with aiohttp.ClientSession(headers=EVOLUTION_HEADERS) as session:
         while True:
-
-            # ════════════════════════════════════════════════════════════════
-            # FASE 1 — ESPERA
-            # Dormimos WAIT_SECS. Si la API estaba fallando, intentamos un
-            # fetch al despertar para confirmar que sigue viva antes de burst.
-            # ════════════════════════════════════════════════════════════════
-            logger.debug(f"[Poller] ⏳ Esperando {WAIT_SECS}s antes del burst...")
-            await asyncio.sleep(WAIT_SECS)
-
-            # Verificación rápida al despertar (descarta sesiones caducadas)
-            probe = await _fetch_with_retries(session, guard)
-            if probe is None:
-                # API caída al inicio del burst → backoff y reintentar ciclo
-                logger.warning(
-                    f"[Poller] ⚠️ API no disponible al iniciar burst — "
-                    f"reintentando en {guard._recon}s"
-                )
-                await asyncio.sleep(guard._recon)
-                continue
-
-            # ════════════════════════════════════════════════════════════════
-            # FASE 2 — BURST
-            # Consultamos cada BURST_INTERVAL hasta encontrar un nuevo giro
-            # resuelto o hasta agotar BURST_TIMEOUT.
-            # ════════════════════════════════════════════════════════════════
-            burst_start = time.time()
-            spin_found  = False
-            logger.debug("[Poller] 🔍 Burst iniciado")
-
-            # Aprovechamos el payload de la sonda si ya trae un giro nuevo
-            candidates = [probe]
-
-            while time.time() - burst_start < BURST_TIMEOUT:
-                for payload in candidates:
-                    if payload is None:
+            try:
+                async with session.get(
+                    EVOLUTION_URL,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"⚠️ API status: {resp.status}")
+                        await asyncio.sleep(recon)          # backoff en HTTP errors
+                        recon = min(recon * 2, 60)
                         continue
+
+                    payload = await resp.json(content_type=None)
+                    recon   = 5
 
                     game_id = str(payload.get("id", ""))
                     if not game_id or game_id == last_id:
+                        await asyncio.sleep(POLL_SECS)
                         continue
 
+                    # Verificar que está resuelto
                     data   = payload.get("data", {})
                     status = data.get("status", "")
                     if status != "Resolved":
+                        await asyncio.sleep(POLL_SECS)
                         continue
 
+                    # Extraer número
                     outcome = data.get("result", {}).get("outcome", {})
                     number  = outcome.get("number")
                     if number is None:
+                        await asyncio.sleep(POLL_SECS)
                         continue
 
                     number = int(number)
                     if not (0 <= number <= 36):
+                        await asyncio.sleep(POLL_SECS)
                         continue
 
-                    # ── Giro válido encontrado ────────────────────────────
-                    elapsed = time.time() - burst_start
-                    logger.info(
-                        f"[Poller] 🎯 Giro #{number} detectado en "
-                        f"{elapsed:.1f}s de burst (game_id={game_id[:12]}...)"
-                    )
-                    await guard.check_gap(number)
+                    # ── Calcular intervalo desde settledAt ────────────────────
+                    current_settled_ts = parse_settled_at(data.get("settledAt", ""))
+                    if current_settled_ts == 0.0:
+                        current_settled_ts = time.time()   # fallback si no hay campo
+
+                    if last_settled_ts > 0 and current_settled_ts > last_settled_ts:
+                        spin_interval = current_settled_ts - last_settled_ts
+                        logger.info(
+                            f"[Poller] ⏱️ Intervalo entre giros: {spin_interval:.1f}s"
+                        )
+
+                    last_settled_ts = current_settled_ts
+
+                    # ── Registrar giro ────────────────────────────────────────
                     last_id = game_id
                     if await engine.process_spin(number, game_id):
                         await engine.broadcast_update(number, game_id)
-                    spin_found = True
-                    break
 
-                if spin_found:
-                    break
+                    # ── Sleep adaptativo ──────────────────────────────────────
+                    # Dormimos hasta el 80 % del intervalo típico, descontando
+                    # el tiempo que ya pasó desde que Evolution publicó el giro.
+                    # Con POLL_SECS = 1 s el siguiente ciclo arranca en modo
+                    # vigilancia rápida automáticamente.
+                    if spin_interval > 5:
+                        elapsed = time.time() - current_settled_ts
+                        safe_sleep = max(spin_interval * 0.80 - elapsed, 0.0)
+                        if safe_sleep > 1:
+                            logger.debug(
+                                f"[Poller] 😴 Sleep adaptativo {safe_sleep:.1f}s "
+                                f"(intervalo={spin_interval:.1f}s, elapsed={elapsed:.1f}s)"
+                            )
+                            await asyncio.sleep(safe_sleep)
+                    continue   # siguiente ciclo sin sleep extra → poll cada 1 s
 
-                # Siguiente tick del burst
-                await asyncio.sleep(BURST_INTERVAL)
-                next_payload = await _fetch_with_retries(session, guard)
-                candidates = [next_payload]
+            except aiohttp.ClientError as e:
+                logger.warning(f"⚠️ Error de red: {e}. Reconectando en {recon}s")
+                await asyncio.sleep(recon)
+                recon = min(recon * 2, 60)
+                continue
+            except Exception as e:
+                logger.error(f"❌ Error inesperado en poller: {e}")
+                await asyncio.sleep(recon)
 
-            if not spin_found:
-                elapsed = time.time() - burst_start
-                logger.warning(
-                    f"[Poller] ⏱️ Burst timeout ({elapsed:.0f}s) sin nuevo giro — "
-                    f"reiniciando ciclo (tirada tardía o API caída)"
-                )
+            await asyncio.sleep(POLL_SECS)
 
 # ─── SELF-PING ────────────────────────────────────────────────────────────────
 async def self_ping_loop():
