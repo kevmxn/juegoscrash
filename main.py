@@ -37,7 +37,9 @@ for _ln in ["aiohttp.access", "aiohttp.server", "urllib3"]:
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 EVOLUTION_URL   = "https://api-cs.casino.org/svc-evolution-game-events/api/immersiveroulette/latest"
-POLL_SECS       = 1
+POLL_SECS       = 2    # intervalo de polling en modo adaptativo (spin 2+)
+DEFAULT_WAIT    = 20    # espera tras el primer giro (sin intervalo conocido)
+DEFAULT_POLL    = 2     # intervalo de polling tras el primer giro
 RENDER_URL      = os.environ.get("RENDER_EXTERNAL_URL", "")
 STATS_DB        = "immersive_stats.db"
 MAX_STORED      = 500
@@ -1488,6 +1490,7 @@ async def poll_evolution():
     last_id         = engine.last_game_id
     last_settled_ts = 0.0   # settledAt del último giro registrado (Unix ts)
     spin_interval   = 0.0   # intervalo calculado entre los dos últimos giros
+    poll_secs       = DEFAULT_POLL  # arranca en 2 s; pasa a 1 s tras calcular intervalo
 
     logger.info(f"🎰 Iniciando poller Evolution: {EVOLUTION_URL}")
 
@@ -1509,26 +1512,26 @@ async def poll_evolution():
 
                     game_id = str(payload.get("id", ""))
                     if not game_id or game_id == last_id:
-                        await asyncio.sleep(POLL_SECS)
+                        await asyncio.sleep(poll_secs)
                         continue
 
                     # Verificar que está resuelto
                     data   = payload.get("data", {})
                     status = data.get("status", "")
                     if status != "Resolved":
-                        await asyncio.sleep(POLL_SECS)
+                        await asyncio.sleep(poll_secs)
                         continue
 
                     # Extraer número
                     outcome = data.get("result", {}).get("outcome", {})
                     number  = outcome.get("number")
                     if number is None:
-                        await asyncio.sleep(POLL_SECS)
+                        await asyncio.sleep(poll_secs)
                         continue
 
                     number = int(number)
                     if not (0 <= number <= 36):
-                        await asyncio.sleep(POLL_SECS)
+                        await asyncio.sleep(poll_secs)
                         continue
 
                     # ── Calcular intervalo desde settledAt ────────────────────
@@ -1549,13 +1552,11 @@ async def poll_evolution():
                     if await engine.process_spin(number, game_id):
                         await engine.broadcast_update(number, game_id)
 
-                    # ── Sleep adaptativo ──────────────────────────────────────
-                    # Dormimos hasta el 80 % del intervalo típico, descontando
-                    # el tiempo que ya pasó desde que Evolution publicó el giro.
-                    # Con POLL_SECS = 1 s el siguiente ciclo arranca en modo
-                    # vigilancia rápida automáticamente.
+                    # ── Sleep post-giro ───────────────────────────────────────
                     if spin_interval > 5:
-                        elapsed = time.time() - current_settled_ts
+                        # Spin 2+ → timing adaptativo + polling a 1 s
+                        poll_secs = POLL_SECS
+                        elapsed   = time.time() - current_settled_ts
                         safe_sleep = max(spin_interval * 0.80 - elapsed, 0.0)
                         if safe_sleep > 1:
                             logger.debug(
@@ -1563,7 +1564,14 @@ async def poll_evolution():
                                 f"(intervalo={spin_interval:.1f}s, elapsed={elapsed:.1f}s)"
                             )
                             await asyncio.sleep(safe_sleep)
-                    continue   # siguiente ciclo sin sleep extra → poll cada 1 s
+                    else:
+                        # Spin 1 → primera vez: espera fija 20 s + polling a 2 s
+                        logger.info(
+                            f"[Poller] 🔰 Primer giro registrado — "
+                            f"esperando {DEFAULT_WAIT}s, luego polling cada {DEFAULT_POLL}s"
+                        )
+                        await asyncio.sleep(DEFAULT_WAIT)
+                    continue   # siguiente ciclo sin sleep extra
 
             except aiohttp.ClientError as e:
                 logger.warning(f"⚠️ Error de red: {e}. Reconectando en {recon}s")
